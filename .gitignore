@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+
+# Claude Code local state (project-level agents/commands/skills would be
+# committed; these are machine-local)
+.claude/.cc-writes/
+.claude/settings.local.json
+
+# macOS
+.DS_Store
