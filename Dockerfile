@@ -100,3 +100,15 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh
 
 EXPOSE 22
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# A digest of this file and entrypoint.sh, passed in by the launcher, recorded
+# so that the image can be asked what it was built from. The base image keeps
+# its tag across rebuilds, so the tag cannot answer that and a stale image is
+# otherwise indistinguishable from a current one; the launcher reads this label
+# back and refuses to start a VM from an image whose sources have moved on.
+#
+# Last in the file, and after ENTRYPOINT, deliberately: a new digest then
+# invalidates nothing but this trailing empty layer, so restamping an image
+# whose real instructions have not changed is a `rebuild --use-cache` away.
+ARG SOURCE_DIGEST=unknown
+LABEL claude-sandbox.source=$SOURCE_DIGEST

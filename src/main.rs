@@ -3,7 +3,10 @@
 //
 // The Dockerfile and entrypoint.sh are embedded at compile time, so the
 // release binary is fully self-contained; changing either file requires a
-// `cargo build` for image rebuilds to pick it up.
+// `cargo build` for image rebuilds to pick it up. A digest of the two is
+// stamped into every base image built here and read back before one is reused,
+// so a binary can never quietly start a VM from an image built from an older
+// copy of them.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::error::ErrorKind;
@@ -24,6 +27,11 @@ use std::time::{Duration, SystemTime};
 const IMAGE_REPO: &str = "claude-sandbox";
 const DOCKERFILE: &str = include_str!("../Dockerfile");
 const ENTRYPOINT: &str = include_str!("../entrypoint.sh");
+
+/// Image label carrying `source_digest()`. Reading it back is what makes a
+/// base image that has fallen behind its sources refusable rather than
+/// invisible.
+const SOURCE_LABEL: &str = "claude-sandbox.source";
 
 /// Per-project image overlay: a directory inside the project holding a
 /// Dockerfile (plus anything it COPYs) that is layered on top of the base
@@ -336,6 +344,26 @@ fn base_from_image(dockerfile: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Digest of everything the base image is built from: the embedded Dockerfile
+/// and the entrypoint it copies in. Stamped into the image as a label at build
+/// time and compared against it before that image is reused, so a launcher
+/// carrying newer sources refuses the image an older one built rather than
+/// booting it as though nothing had changed.
+///
+/// The authorized keys are deliberately not folded in. They are a build arg
+/// rather than a source file, and they move whenever a new `~/.ssh/id_*.pub`
+/// appears; an image whose set has fallen behind costs at most a manual `ssh`
+/// by a key that is not listed yet — never the launcher's own, which is
+/// generated before any build. A full rebuild is far too much to charge for
+/// that, and charging it every time would teach people to ignore the refusal.
+fn source_digest() -> String {
+    let mut h = Sha256::new();
+    h.update(DOCKERFILE.as_bytes());
+    h.update([0]);
+    h.update(ENTRYPOINT.as_bytes());
+    format!("{:x}", h.finalize())[..16].to_string()
 }
 
 /// Named when a build that discarded the cache fails. `--no-cache` is the one
@@ -909,12 +937,21 @@ impl Sandbox {
     /// should run: base -> global -> project, each layer on whatever is
     /// beneath it. `force_base` rebuilds the base even when it already exists.
     fn ensure_images(&self, opts: &Opts, force_base: bool) -> Result<String> {
+        // Before anything else, and before the overlay prompt in particular:
+        // a base image that has fallen behind its sources ends this run, and
+        // asking someone to review an overlay for a launch that is about to be
+        // refused spends the one prompt here that wants their full attention.
+        let reuse_base = !force_base && self.have_image(&self.base_image)?;
+        if reuse_base {
+            self.check_base_current()?;
+        }
+
         // Ask about the overlay before building anything: the answer decides
         // which image is wanted, and "skip" should not arrive after a build.
         let overlay = self.resolve_overlay(opts)?;
         let global = self.resolve_global(opts)?;
 
-        if force_base || !self.have_image(&self.base_image)? {
+        if !reuse_base {
             self.build_image()?;
         }
         let mut image = self.base_image.clone();
@@ -1178,6 +1215,9 @@ impl Sandbox {
         let pubkey_arg = format!("SSH_PUBKEY={pubkeys}");
         let user_arg = format!("USERNAME={}", self.user);
         let sudo_arg = format!("SUDO={}", self.sudo as u8);
+        // What the image is asked for by `check_base_current` on every launch
+        // after this one.
+        let digest_arg = format!("SOURCE_DIGEST={}", source_digest());
         let ctx_arg = ctx.to_string_lossy().into_owned();
         let mut args: Vec<&str> = vec![
             "build",
@@ -1189,6 +1229,8 @@ impl Sandbox {
             &user_arg,
             "--build-arg",
             &sudo_arg,
+            "--build-arg",
+            &digest_arg,
         ];
         if self.no_cache {
             args.push("--no-cache");
@@ -1202,6 +1244,73 @@ impl Sandbox {
 
     fn have_image(&self, tag: &str) -> Result<bool> {
         Ok(capture("container", &["image", "inspect", tag]).is_ok())
+    }
+
+    /// What `tag` records about the sources it was built from: `Some` when the
+    /// image carries the label, `None` when it does not — built by a launcher
+    /// older than the label, or built by hand. `Err` is kept for not having
+    /// been able to ask at all, which is a different thing from an answer.
+    fn image_source(&self, tag: &str) -> Result<Option<String>> {
+        let out = capture("container", &["image", "inspect", tag])?;
+        let v: serde_json::Value = serde_json::from_str(&out)
+            .with_context(|| format!("parsing `container image inspect {tag}`"))?;
+        // One entry per architecture, all built from the same Dockerfile, so
+        // the first one carrying the label answers for the image.
+        for arch in v[0]["variants"].as_array().into_iter().flatten() {
+            if let Some(s) = arch["config"]["config"]["Labels"][SOURCE_LABEL].as_str() {
+                return Ok(Some(s.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// End the run rather than start a VM from a base image that was not built
+    /// from the sources this binary carries.
+    ///
+    /// The base image keeps its tag across rebuilds — that is what lets every
+    /// project find it — so unlike an overlay's, its tag cannot say which
+    /// Dockerfile produced it, and `have_image` is satisfied either way.
+    /// Without this, editing the Dockerfile and rebuilding the binary leaves
+    /// every project booting the old image indefinitely, with nothing on
+    /// screen to suggest it.
+    ///
+    /// A refusal rather than a rebuild because a base build is minutes of apt
+    /// and npm: having that begin on its own out of `claude-sandbox <dir>` is
+    /// worse than being told the command to run. Overlays need no equivalent —
+    /// their tags carry a fingerprint of what they were built from, so a
+    /// changed one simply builds.
+    fn check_base_current(&self) -> Result<()> {
+        let found = match self.image_source(&self.base_image) {
+            Ok(found) => found,
+            // The runtime answered in a shape this does not understand. Worth
+            // saying; not worth refusing to work over.
+            Err(e) => {
+                eprintln!(
+                    "claude-sandbox: warning: could not read what {} was built from \
+                     ({e:#});\n  using it as though it were current",
+                    self.base_image
+                );
+                return Ok(());
+            }
+        };
+        if found.as_deref() == Some(source_digest().as_str()) {
+            return Ok(());
+        }
+        bail!(
+            "{} {}.\n  \
+             Refusing to start a VM from it: it is not the image this build of \
+             claude-sandbox describes.\n  \
+             rebuild it:            claude-sandbox rebuild {dir}\n  \
+             or keep cached layers: claude-sandbox rebuild --use-cache {dir}",
+            self.base_image,
+            match found {
+                Some(_) => "was built from a different Dockerfile or entrypoint.sh than this \
+                            build of claude-sandbox carries",
+                None => "does not record which sources it was built from, so it predates this \
+                         check or was built by hand",
+            },
+            dir = self.abs.display()
+        );
     }
 
     /// Attach `NO_CACHE_HINT` to a failed build, but only when the cache was
@@ -1516,11 +1625,13 @@ impl Sandbox {
     /// Build (or reuse) one image layer on top of `parent`.
     ///
     /// The tag carries a fingerprint of the layer's contents, of the image it
-    /// sits on, and of the base image's build stamp — so "is this image
-    /// current?" is answered by whether the tag exists. Editing a layer and
-    /// editing it back costs nothing; changing one invalidates everything
-    /// stacked above it. No bookkeeping to go stale, and it heals itself if
-    /// images are pruned by hand.
+    /// sits on, of the base image's build stamp, and of the Dockerfile that is
+    /// actually built — so "is this image current?" is answered by whether the
+    /// tag exists. Editing a layer and editing it back costs nothing; changing
+    /// one invalidates everything stacked above it. No bookkeeping to go
+    /// stale, and it heals itself if images are pruned by hand. That last
+    /// input is why the base image needs `check_base_current` and these layers
+    /// do not: here a changed Dockerfile changes the tag and simply builds.
     ///
     /// `context` is the directory built; `source` is the path to name in
     /// messages, which differs when the two are not the same (the project
@@ -1534,12 +1645,23 @@ impl Sandbox {
         source: &Path,
         parent: &str,
     ) -> Result<String> {
+        let fragment = fs::read_to_string(context.join("Dockerfile"))
+            .with_context(|| format!("reading {}", context.join("Dockerfile").display()))?;
+        let body = check_fragment(&fragment)?;
+        let generated = self.generated_dockerfile(&body, source, parent);
+
+        // The generated Dockerfile is hashed alongside the context it is built
+        // from, not just the fragment inside it: the launcher wraps that
+        // fragment in directives of its own, and a release that changes the
+        // wrapper would otherwise go on reusing layers built without it.
         let mut h = Sha256::new();
         h.update(fp.as_bytes());
         h.update([0]);
         h.update(parent.as_bytes());
         h.update([0]);
         h.update(self.base_stamp()?.as_bytes());
+        h.update([0]);
+        h.update(generated.as_bytes());
         let tag = format!(
             "{IMAGE_REPO}:{stem}-{}",
             &format!("{:x}", h.finalize())[..8]
@@ -1548,10 +1670,6 @@ impl Sandbox {
             return Ok(tag);
         }
 
-        let fragment = fs::read_to_string(context.join("Dockerfile"))
-            .with_context(|| format!("reading {}", context.join("Dockerfile").display()))?;
-        let body = check_fragment(&fragment)?;
-
         let build = record.join("build");
         if build.exists() {
             fs::remove_dir_all(&build)?;
@@ -1559,10 +1677,7 @@ impl Sandbox {
         copy_context(context, &build)?;
         // Overwrites the copy of the authored Dockerfile: the build reads the
         // generated one, and the original stays where it was written.
-        fs::write(
-            build.join("Dockerfile"),
-            self.generated_dockerfile(&body, source, parent),
-        )?;
+        fs::write(build.join("Dockerfile"), &generated)?;
 
         println!("building {tag} from {} ...", source.display());
         // Overlays go stale exactly the way the base does — an `apt-get

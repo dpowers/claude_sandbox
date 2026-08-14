@@ -456,8 +456,9 @@ it works after the project directory itself is gone.
 
 ### Rebuilds
 
-Each layer's image is tagged with a fingerprint of its own contents, of the
-image it sits on, and of the base image's build stamp — so "is this image
+Each overlay layer's image is tagged with a fingerprint of its own contents, of
+the image it sits on, of the base image's build stamp, and of the Dockerfile
+the launcher generates around the fragment you wrote — so "is this image
 current?" is answered by whether that tag exists. Editing a layer and editing
 it back costs nothing, and changing one invalidates everything stacked above
 it: edit the global overlay and every project's rebuilds; rebuild the base and
@@ -468,6 +469,39 @@ mounts.
 Superseded tags are deleted as each layer is rebuilt, so they don't accumulate
 one per edit. Only the layers unique to them are freed; everything underneath
 is shared.
+
+The base image is the exception, and it needs one. It keeps the same tag across
+rebuilds — that is what lets every project find it — so unlike an overlay's, its
+tag cannot say which `Dockerfile` produced it. Left at that, editing `Dockerfile`
+or `entrypoint.sh`, rebuilding the binary, and never getting round to a
+`rebuild` would leave every project booting the old image indefinitely, with
+nothing on screen to suggest it. So each base build stamps a digest of those two
+files into the image as a `claude-sandbox.source` label, and every launch reads
+it back before starting a VM. If it doesn't match the sources compiled into the
+binary — or the image predates the label, or was built by hand — the launch is
+refused and names the command to fix it:
+
+```
+claude-sandbox: claude-sandbox:you was built from a different Dockerfile or entrypoint.sh
+  than this build of claude-sandbox carries.
+  Refusing to start a VM from it: it is not the image this build of claude-sandbox describes.
+  rebuild it:            claude-sandbox rebuild ~/Projects/my-app
+  or keep cached layers: claude-sandbox rebuild --use-cache ~/Projects/my-app
+```
+
+A refusal rather than an automatic rebuild because a base build is minutes of
+apt and npm, and having that start on its own out of `claude-sandbox <dir>` is
+worse than being told which command to run. The check happens before the overlay
+acceptance prompt, so a launch that is going to be refused doesn't spend the one
+prompt here that wants your full attention. `rebuild` itself is never refused —
+it is the way out — and the `--use-cache` form is the one to reach for when the
+sources moved but you don't want every package refetched.
+
+The authorized keys are deliberately not part of that digest. They are a build
+arg rather than a source file and they move whenever a new `~/.ssh/id_*.pub`
+appears; an image whose set has fallen behind costs at most a manual `ssh` by a
+key that isn't listed yet — never the launcher's own — and a full rebuild is too
+much to charge for that.
 
 That machinery answers "have these instructions changed?", which is a different
 question from "have their *results* changed" — see [Keeping images up to
@@ -561,7 +595,12 @@ consumes.
    "skip" never arrives after a five-minute build. The global overlay is read
    here too, without a prompt.
 5. **Image** — build `claude-sandbox:<user>` if absent (`…-sudo` under
-   `--sudo`). The account name is baked into the image, so it goes in the tag:
+   `--sudo`); if it is already there, check its `claude-sandbox.source` label
+   against a digest of the embedded `Dockerfile` and `entrypoint.sh` and refuse
+   the launch if they disagree (see [Rebuilds](#rebuilds)). That check actually
+   runs before the overlay step above, so a launch that is going to be refused
+   never asks you to review an overlay first.
+   The account name is baked into the image, so it goes in the tag:
    changing `CLAUDE_SANDBOX_USER` builds a second image rather than booting one
    whose only account you can't log in as. So is whether that account can
    become root, for the same reason — reusing one variant for the other would
@@ -698,9 +737,15 @@ and nobody has to tag for installs to work — the version in `Cargo.toml` is wh
 - **Dockerfile edits appear to do nothing** — for the *base* image
   (`Dockerfile` in this repo), rebuild the binary (`cargo build --release`);
   the image sources are compiled in. Then `rebuild --use-cache`, which is the
-  seconds-long form. For a *project's* `.claude-sandbox/Dockerfile`, the
+  seconds-long form. You shouldn't get this far silently: once the binary is
+  rebuilt, launches refuse the stale image outright rather than booting it (see
+  [Rebuilds](#rebuilds)). For a *project's* `.claude-sandbox/Dockerfile`, the
   launcher picks changes up on the next launch and asks you to accept them —
   check `claude-sandbox overlay <dir>` if it didn't.
+- **"Refusing to start a VM from it" on a base image you never touched** — most
+  likely the image predates the `claude-sandbox.source` label, which is the one
+  case the check can't tell apart from a genuinely stale image. `rebuild
+  --use-cache <dir>` restamps it in seconds without refetching anything.
 - **A package in the image is out of date, and rebuilding doesn't move it** —
   you are getting the builder's cached layer. That is what plain `rebuild`
   (no `--use-cache`) exists for; see [Keeping images up to
