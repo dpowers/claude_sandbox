@@ -25,5 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: Homebrew/actions/setup-homebrew@master
+      # Pinned rather than @master: Homebrew deprecated the branch ref and turns
+      # the warning into an error at 5.2.0. The comment is the readable version
+      # of the SHA — bump both together.
+      - uses: Homebrew/actions/setup-homebrew@1f8e202ffddf94def7f42f6fa3a482e821489f9c # 2026.07.10.1
       - run: brew style Formula/claude-sandbox.rb
