@@ -1,16 +1,18 @@
 # claude-sandbox
 
 Run a project directory inside a disposable, network-restricted VM with Claude
-Code installed, and open [Zed](https://zed.dev) on the host connected to it over
-SSH.
+Code installed, and connect to it over SSH — from [Zed](https://zed.dev) on the
+host, or a plain shell.
 
 ```
-claude-sandbox ~/Projects/my-app
+claude-sandbox zed ~/Projects/my-app
 ```
 
 That command builds the image if needed, boots a VM for the project, bind-mounts
 the directory into it, waits for `sshd`, and execs `zed ssh://…`. Close the Zed
-window and the VM stops and deletes itself.
+window and the VM stops and deletes itself. The bare `claude-sandbox <dir>` does
+everything but the hand-off: it leaves the VM running and prints the ways to
+connect.
 
 ## Purpose
 
@@ -49,7 +51,7 @@ behind an explicit acceptance step, for the same reasons as everything above.
   `~/.cargo/bin` is used if you have one; Homebrew installs its own only when
   you don't.
 - **[Zed](https://zed.dev)** on the host, with the `zed` CLI on `PATH` — only
-  for the default `up` command; `claude-sandbox shell` needs just `ssh`. Each
+  for the `zed` command; every other mode needs just `ssh`. Each
   VM is a host Zed has never seen, so projects open in Restricted Mode until
   you trust them — see [Restricted Mode](#5-lift-zeds-restricted-mode).
 - **macOS Local Network permission** for the terminal app you launch from:
@@ -151,7 +153,7 @@ ln -s "$PWD/target/release/claude-sandbox" /usr/local/bin/claude-sandbox
 ### 4. Run it
 
 ```sh
-claude-sandbox ~/Projects/my-app     # first run builds the image (a few minutes)
+claude-sandbox zed ~/Projects/my-app  # first run builds the image (a few minutes)
 ```
 
 The first connection to a VM may trigger the macOS Local Network permission
@@ -197,7 +199,8 @@ this the first time it opens Zed and then keeps quiet; delete
 
 | Command | What it does |
 | --- | --- |
-| `claude-sandbox <dir>` | Start the VM (building/creating as needed) and open Zed |
+| `claude-sandbox <dir>` | Start the VM (building/creating as needed) and print the ways to connect |
+| `claude-sandbox zed <dir>` | Same, then open Zed on it over `ssh` |
 | `claude-sandbox shell <dir> [cmd…]` | Same, but `ssh` in instead of opening Zed |
 | `claude-sandbox stop <dir>` | Stop the project's VM (it deletes itself on stop) |
 | `claude-sandbox rm <dir>` | Stop and delete the VM, and drop its ssh-config block |
@@ -669,8 +672,9 @@ consumes.
    `IdentitiesOnly`, no host-key checking — the host key is new every boot).
    `~/.ssh/config` gets an `Include` line prepended if it doesn't already have
    one. Other projects' blocks are preserved.
-9. **Hand off** — `exec` into `zed ssh://user@host/path`, or into `ssh` for the
-   `shell` subcommand.
+9. **Hand off** — `exec` into `zed ssh://user@host/path` for the `zed` mode, or
+   into `ssh` for `shell`. The bare mode has nothing to exec: it prints how to
+   connect and exits, leaving the VM its boot grace to receive a connection.
 
 ### Why connect by IP rather than name
 

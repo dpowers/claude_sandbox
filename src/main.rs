@@ -1,5 +1,6 @@
 // claude-sandbox — run a project directory inside a firewalled VM (Apple
-// `container`) and open Zed on the host connected to it over SSH.
+// `container`), reached over SSH: `zed` opens Zed on the host connected to
+// it, `shell` sshes in, and the bare form just brings the VM up.
 //
 // The Dockerfile and entrypoint.sh are embedded at compile time, so the
 // release binary is fully self-contained; changing either file requires a
@@ -74,7 +75,7 @@ const DEFAULT_CPUS: &str = "6";
 
 // One paragraph, deliberately: a second one would make clap treat --help as
 // "long help" and print a spaced-out page twice the length of -h.
-/// Run a project directory inside a claude-sandbox VM and open Zed over SSH
+/// Run a project directory inside a claude-sandbox VM, reached over SSH
 #[derive(Parser)]
 #[command(
     name = "claude-sandbox",
@@ -85,7 +86,8 @@ const DEFAULT_CPUS: &str = "6";
     subcommand_negates_reqs = true,
     disable_help_subcommand = true,
     after_help = "With no mode, <DIR> starts the VM, building and creating whatever is\n\
-                  missing. The README covers the security model, image overlays,\n\
+                  missing, and leaves it running; `zed` and `shell` do the same and\n\
+                  then connect. The README covers the security model, image overlays,\n\
                   environment variables, and where state lives on the host."
 )]
 struct Cli {
@@ -97,6 +99,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Mode {
+    /// Start the VM and open Zed on it over ssh
+    Zed(ZedArgs),
     /// Same, but ssh in instead of opening Zed
     Shell(ShellArgs),
     /// Stop the project's VM (it deletes itself on stop)
@@ -154,6 +158,16 @@ struct UpArgs {
     /// Superseded by the `rebuild` mode; kept to say so.
     #[arg(long, hide = true)]
     rebuild: bool,
+}
+
+#[derive(Args)]
+struct ZedArgs {
+    #[command(flatten)]
+    image: ImageArgs,
+    #[command(flatten)]
+    vm: VmArgs,
+    /// Project directory
+    dir: String,
 }
 
 #[derive(Args)]
@@ -226,6 +240,7 @@ struct RebuildArgs {
 #[derive(PartialEq, Clone, Copy)]
 enum Cmd {
     Up,
+    Zed,
     Shell,
     Stop,
     Rm,
@@ -477,6 +492,10 @@ fn run() -> Result<()> {
             let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, ..a.image.into() };
             (Cmd::Up, dir, opts, Vec::new(), OverlayAction::Status)
         }
+        Some(Mode::Zed(a)) => {
+            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, ..a.image.into() };
+            (Cmd::Zed, a.dir, opts, Vec::new(), OverlayAction::Status)
+        }
         Some(Mode::Shell(a)) => {
             let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, ..a.image.into() };
             (Cmd::Shell, a.dir, opts, a.argv, OverlayAction::Status)
@@ -498,7 +517,7 @@ fn run() -> Result<()> {
         Cmd::Rm => sb.remove(),
         Cmd::Overlay => sb.overlay_cmd(overlay_action),
         Cmd::Rebuild => sb.rebuild(&opts),
-        Cmd::Up | Cmd::Shell => sb.up(cmd, &opts, &ssh_args),
+        Cmd::Up | Cmd::Zed | Cmd::Shell => sb.up(cmd, &opts, &ssh_args),
     }
 }
 
@@ -1072,10 +1091,24 @@ impl Sandbox {
             ssh.arg(&host).args(ssh_args);
             return Err(ssh.exec()).context("failed to exec ssh");
         }
-        println!("opening zed on {host} at {}", self.target);
-        self.zed_trust_notice();
-        let url = format!("ssh://{}@{host}{}", self.user, self.target);
-        Err(Command::new("zed").arg(url).exec()).context("failed to exec zed")
+        if cmd == Cmd::Zed {
+            println!("opening zed on {host} at {}", self.target);
+            self.zed_trust_notice();
+            let url = format!("ssh://{}@{host}{}", self.user, self.target);
+            return Err(Command::new("zed").arg(url).exec()).context("failed to exec zed");
+        }
+        // The bare mode ends here: VM up, ssh config written. "Ready" has a
+        // shelf life — a VM nothing connects to reaps itself after the boot
+        // grace — so say how to connect rather than leave it to be known.
+        println!(
+            "{name} is ready\n  \
+             zed:    claude-sandbox zed {dir}\n  \
+             shell:  claude-sandbox shell {dir}  (or: ssh {name})\n  \
+             it deletes itself if nothing connects for about two minutes",
+            name = self.name,
+            dir = self.abs.display()
+        );
+        Ok(())
     }
 
     /// Zed opens a worktree it has not been told to trust in Restricted Mode:

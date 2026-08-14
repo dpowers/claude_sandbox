@@ -94,8 +94,8 @@ class ClaudeSandbox < Formula
         brew install container
         container system start
 
-      Opening a project (`claude-sandbox <dir>`) also needs Zed's `zed` CLI on
-      PATH. `claude-sandbox shell <dir>` needs only `ssh`.
+      Opening a project in Zed (`claude-sandbox zed <dir>`) also needs Zed's
+      `zed` CLI on PATH. Every other mode needs only `ssh`.
     EOS
   end
 
