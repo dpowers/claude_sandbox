@@ -42,7 +42,8 @@ behind an explicit acceptance step, for the same reasons as everything above.
   CLI (developed against v1.2.2; installation below). Each container gets its
   own VM, which is what makes the in-guest firewall trustworthy and lets the
   guest hold `CAP_NET_ADMIN` without weakening the host.
-- **Rust** (stable, edition 2021) to build the launcher.
+- **Rust** (stable, edition 2021) to build the launcher — Homebrew installs it
+  for you if you go that route.
 - **[Zed](https://zed.dev)** on the host, with the `zed` CLI on `PATH` — only
   for the default `up` command; `claude-sandbox shell` needs just `ssh`. Each
   VM is a host Zed has never seen, so projects open in Restricted Mode until
@@ -93,7 +94,33 @@ sudo container system dns delete container
 sudo container system dns create container
 ```
 
-### 3. Build the launcher
+### 3. Install the launcher
+
+With Homebrew — this repository is also its own tap:
+
+```sh
+brew tap dpowers/claude-sandbox https://github.com/dpowers/claude_sandbox
+brew install claude-sandbox
+```
+
+The URL is not optional: the short `brew tap dpowers/claude-sandbox` form looks
+for a repository named `homebrew-claude-sandbox`, and this one is called
+`claude_sandbox`. Passing the URL says where the tap actually lives; you only
+do it once, and `brew update` follows it from then on. Homebrew builds from
+source and pulls in Rust as a build dependency (`brew autoremove` drops it
+again later, if you have no other use for it).
+
+Later, the usual:
+
+```sh
+brew upgrade claude-sandbox
+```
+
+To track `main` instead of releases, `brew install --HEAD claude-sandbox` and
+upgrade with `brew upgrade --fetch-HEAD claude-sandbox` — plain `brew upgrade`
+leaves `--HEAD` installs alone, since it has no version to compare against.
+
+Or from a clone, without Homebrew:
 
 ```sh
 cargo build --release
@@ -510,6 +537,38 @@ grace period down to the short idle timeout.
 | `~/.config/claude-sandbox/containers/<name>.image` | Which image a running VM was created from, for the staleness check |
 | `~/.config/claude-sandbox/base-<user>.stamp` | Bumped on every base-image rebuild, so overlays rebuild on top of it |
 | `~/.claude-sandbox/` | Mounted as `~/.claude` in every VM — the persistent Claude Code login and settings |
+
+## Releasing
+
+`Formula/claude-sandbox.rb` is what Homebrew reads, and it names an exact
+tarball and checksum, so a release is really two things: a tag, and a formula
+pointed at that tag.
+
+```sh
+# bump `version` in Cargo.toml, then
+cargo build --release          # refreshes Cargo.lock's own entry
+git commit -am "Release 0.2.0"
+git tag v0.2.0
+git push origin main v0.2.0
+```
+
+Pushing the tag runs [`release.yml`](.github/workflows/release.yml), which
+creates the GitHub release and then runs
+[`scripts/bump-formula.sh`](scripts/bump-formula.sh) to rewrite the formula's
+`url` and `sha256` and commit that back to `main`. The order matters: GitHub
+only generates a tag's source tarball once the tag exists, so the checksum
+cannot be computed before pushing. The script refuses to run if `Cargo.toml`'s
+version and the tag disagree.
+
+Doing it by hand is the same two steps:
+
+```sh
+git push origin v0.2.0
+scripts/bump-formula.sh v0.2.0
+git commit -am "Point the Homebrew formula at v0.2.0" && git push
+```
+
+Users pick the new version up on their next `brew update && brew upgrade`.
 
 ## Troubleshooting
 

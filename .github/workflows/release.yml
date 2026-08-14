@@ -1,0 +1,55 @@
+# Tagging `v<x.y.z>` publishes a release and points the in-repo Homebrew
+# formula at it, which is what makes `brew upgrade` see the new version:
+#
+#   # bump `version` in Cargo.toml, commit, then
+#   git tag v0.2.0 && git push origin main v0.2.0
+#
+# The formula bump is a commit pushed back to the default branch. If that branch
+# is protected, either allow this workflow to bypass the rule or run
+# scripts/bump-formula.sh locally and push the result yourself.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  formula:
+    name: Publish the release and bump the formula
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The bump commit belongs on the branch, not on the detached tag.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+
+      - name: Point the formula at ${{ github.ref_name }}
+        run: scripts/bump-formula.sh "${{ github.ref_name }}"
+
+      - name: Commit the bump
+        env:
+          BRANCH: ${{ github.event.repository.default_branch }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if git diff --quiet -- Formula; then
+            echo "formula already points at $TAG"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Point the Homebrew formula at $TAG" -- Formula
+          git push origin "HEAD:$BRANCH"

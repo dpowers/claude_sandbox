@@ -1,0 +1,25 @@
+# A broken formula only shows up when someone tries to install it, by which
+# point it is already on `main` and in everyone's `brew update`. This runs
+# Homebrew's own linter over it instead, which loads the file and so catches
+# syntax errors as well as style ones.
+#
+# `brew audit` is deliberately not run: it wants a `license` (this repo has no
+# LICENSE file) and a real `sha256` (all zeros until the first tag).
+name: formula
+
+on:
+  push:
+    branches: [main]
+    paths: ["Formula/**", ".github/workflows/formula.yml"]
+  pull_request:
+    paths: ["Formula/**", ".github/workflows/formula.yml"]
+
+jobs:
+  style:
+    name: brew style
+    # Linting parses the formula rather than installing it, so it does not need
+    # the macOS/arm64 host the formula itself insists on.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: brew style Formula/claude-sandbox.rb
