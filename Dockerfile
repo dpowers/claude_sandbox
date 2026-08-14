@@ -7,8 +7,16 @@ ARG USERNAME=claude
 # Base tooling, sshd, and Node.js 22 (required by Claude Code). The NodeSource
 # script is downloaded to a file first so a failed download fails the build
 # instead of silently leaving the stock Ubuntu Node packages in play.
+#
+# build-essential pulls in the C/C++ toolchain (gcc, g++, cpp, make, libc6-dev)
+# and binutils, which supplies the linker. It is in the base rather than left to
+# a per-project overlay because nearly every language runtime that gets used in
+# here shells out to cc/ld somewhere — native npm modules via node-gyp, cgo, Rust
+# crates with build scripts, Python wheels built from source. pkg-config comes
+# along for the same reason: those builds locate system libraries through it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git sudo openssh-server vim less procps unzip nftables \
+        build-essential pkg-config \
     && curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource.sh \
     && bash /tmp/nodesource.sh \
     && rm /tmp/nodesource.sh \

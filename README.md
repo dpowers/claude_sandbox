@@ -201,8 +201,10 @@ mounts.
 
 ## Per-project image overlay
 
-The base image is deliberately thin — Ubuntu, Node, git, the Claude Code CLI.
-When a project needs more than that, put a Dockerfile in the project itself:
+The base image is deliberately thin — Ubuntu, Node, git, the Claude Code CLI,
+and a C/C++ toolchain (`build-essential` + `pkg-config`) for the native builds
+most language ecosystems fall back to. When a project needs more than that, put
+a Dockerfile in the project itself:
 
 ```
 <project>/.claude-sandbox/Dockerfile
@@ -339,7 +341,7 @@ Three files, one binary:
 | File | Role |
 | --- | --- |
 | `src/main.rs` | The `claude-sandbox` launcher: name derivation, image build, container lifecycle, readiness polling, ssh-config management |
-| `Dockerfile` | The guest image: Ubuntu 24.04 + Node 22 + Claude Code CLI + `sshd`, key-only login, passwordless sudo |
+| `Dockerfile` | The guest image: Ubuntu 24.04 + Node 22 + Claude Code CLI + `build-essential` + `sshd`, key-only login, passwordless sudo |
 | `entrypoint.sh` | Runs in the guest at boot: applies the egress firewall, makes `.claude-sandbox/` read-only, starts the idle watchdog, execs `sshd` |
 
 `Dockerfile` and `entrypoint.sh` are embedded into the binary with
