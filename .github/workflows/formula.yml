@@ -4,7 +4,7 @@
 # syntax errors as well as style ones.
 #
 # `brew audit` is deliberately not run: it wants a `license` (this repo has no
-# LICENSE file) and a real `sha256` (all zeros until the first tag).
+# LICENSE file) and objects to head-only formulae, which this one is on purpose.
 name: formula
 
 on:

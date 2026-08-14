@@ -113,15 +113,14 @@ do it once, and `brew update` follows it from then on. Homebrew builds from
 source and pulls in Rust as a build dependency (`brew autoremove` drops it
 again later, if you have no other use for it).
 
-Later, the usual:
+The formula is head-only: there is no release tarball, so `brew install` always
+builds the current `main`. That also means upgrades need `--fetch-HEAD`, because
+plain `brew upgrade` skips HEAD installs — there is no version number for it to
+compare against:
 
 ```sh
-brew upgrade claude-sandbox
+brew upgrade --fetch-HEAD claude-sandbox
 ```
-
-To track `main` instead of releases, `brew install --HEAD claude-sandbox` and
-upgrade with `brew upgrade --fetch-HEAD claude-sandbox` — plain `brew upgrade`
-leaves `--HEAD` installs alone, since it has no version to compare against.
 
 Or from a clone, without Homebrew:
 
@@ -663,9 +662,11 @@ grace period down to the short idle timeout.
 
 ## Releasing
 
-`Formula/claude-sandbox.rb` is what Homebrew reads, and it names an exact
-tarball and checksum, so a release is really two things: a tag, and a formula
-pointed at that tag.
+`Formula/claude-sandbox.rb` is head-only — it names no tarball or checksum, just
+the repository — so pushing to `main` *is* the release. Anyone on the tap picks
+it up with `brew upgrade --fetch-HEAD claude-sandbox`.
+
+Tags are optional on top of that, and only produce a changelog:
 
 ```sh
 # bump `version` in Cargo.toml, then
@@ -675,23 +676,10 @@ git tag v0.2.0
 git push origin main v0.2.0
 ```
 
-Pushing the tag runs [`release.yml`](.github/workflows/release.yml), which
-creates the GitHub release and then runs
-[`scripts/bump-formula.sh`](scripts/bump-formula.sh) to rewrite the formula's
-`url` and `sha256` and commit that back to `main`. The order matters: GitHub
-only generates a tag's source tarball once the tag exists, so the checksum
-cannot be computed before pushing. The script refuses to run if `Cargo.toml`'s
-version and the tag disagree.
-
-Doing it by hand is the same two steps:
-
-```sh
-git push origin v0.2.0
-scripts/bump-formula.sh v0.2.0
-git commit -am "Point the Homebrew formula at v0.2.0" && git push
-```
-
-Users pick the new version up on their next `brew update && brew upgrade`.
+Pushing a `v*` tag runs [`release.yml`](.github/workflows/release.yml), which
+creates a GitHub release with generated notes. It does not touch the formula,
+and nobody has to tag for installs to work — the version in `Cargo.toml` is what
+`claude-sandbox --version` reports, so bump it when it would otherwise go stale.
 
 ## Troubleshooting
 

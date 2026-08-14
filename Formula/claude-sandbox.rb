@@ -7,28 +7,23 @@
 #   brew tap dpowers/claude-sandbox https://github.com/dpowers/claude_sandbox
 #   brew install claude-sandbox
 #
-# `url` and `sha256` are rewritten by scripts/bump-formula.sh, which the release
-# workflow runs on every `v*` tag — edit the version in Cargo.toml, tag, and let
-# CI point the formula at the new tarball.
+# The formula is head-only on purpose: there is no `url`/`sha256` pair naming a
+# release tarball, so `brew install` always builds the current `main` and a
+# release is just a push. The cost is that `brew upgrade` skips HEAD kegs unless
+# it is told to re-check the remote — see the caveats below.
 class ClaudeSandbox < Formula
   # Kept short on purpose: Homebrew caps "<name>: <desc>" at 80 characters.
   desc "Disposable, network-restricted VM per project, with Claude Code"
   homepage "https://github.com/dpowers/claude_sandbox"
-  url "https://github.com/dpowers/claude_sandbox/archive/refs/tags/v0.1.0.tar.gz"
-  # All zeros means the tag above has not been published yet — GitHub only
-  # generates a tag's tarball once the tag exists, so the checksum cannot be
-  # known before then. Install with `--HEAD` until it is.
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   head "https://github.com/dpowers/claude_sandbox.git", branch: "main"
 
-  # No livecheck block: the default Git strategy already reads `v*` tags off
-  # the repository behind the archive URL, and does it without spending GitHub
-  # API requests the way the `github_latest` strategy would.
+  # No livecheck block: it exists to spot new stable releases, and a head-only
+  # formula has no stable version to compare against.
 
   depends_on "rust" => :build
-  depends_on :macos
   # Every VM is an Apple `container` VM, which exists on Apple silicon only.
   depends_on arch: :arm64
+  depends_on :macos
 
   # The launcher is a single self-contained binary — the Dockerfile and
   # entrypoint.sh are `include_str!`d into it at compile time — so there is
@@ -39,6 +34,11 @@ class ClaudeSandbox < Formula
 
   def caveats
     <<~EOS
+      This formula tracks `main`, and `brew upgrade` leaves HEAD installs alone
+      because there is no version number to compare. To pick up new commits:
+
+        brew upgrade --fetch-HEAD claude-sandbox
+
       claude-sandbox drives Apple's `container` CLI, which is deliberately not a
       formula dependency: an existing install from Apple's signed .pkg would end
       up shadowed by a second copy, and installing the formula stops any running
@@ -53,8 +53,14 @@ class ClaudeSandbox < Formula
   end
 
   test do
-    assert_match "claude-sandbox shell", shell_output("#{bin}/claude-sandbox --help")
-    # No arguments is a usage error: usage on stderr, exit 1.
-    assert_match "usage:", shell_output("#{bin}/claude-sandbox 2>&1", 1)
+    help = shell_output("#{bin}/claude-sandbox --help")
+    assert_match "Usage: claude-sandbox", help
+    assert_match "Rebuild every image layer", help
+
+    assert_match "claude-sandbox", shell_output("#{bin}/claude-sandbox --version")
+
+    # Neither a directory nor a subcommand is a clap usage error: clap prints to
+    # stderr and exits 2, which is not the 1 a hand-rolled usage error would use.
+    assert_match "Usage: claude-sandbox", shell_output("#{bin}/claude-sandbox 2>&1", 2)
   end
 end
