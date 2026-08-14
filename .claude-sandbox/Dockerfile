@@ -1,9 +1,5 @@
 # Image overlay for this project: a Rust toolchain.
 #
-# claude-sandbox is itself a Cargo crate, so a sandbox for it can't build,
-# test, or lint anything without one. Layered on top of the base image (and the
-# global overlay, if there is one) — no FROM line, the launcher supplies it.
-#
 # rustup rather than Ubuntu's rustc/cargo packages: 24.04 pins 1.75, and a
 # toolchain that can't be moved off the distro's version is the wrong shape for
 # a disposable dev VM — `rustup update`, `+nightly`, and extra targets all stop
