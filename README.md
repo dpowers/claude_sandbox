@@ -250,10 +250,15 @@ off and root's own password is locked, so there is no other way in either.
 That default is what the egress firewall rests on. The `nftables` rules are
 enforced by the guest's own kernel and the guest holds `CAP_NET_ADMIN`, so root
 in there could delete the whole table with the same one-line command the
-entrypoint uses to replace it. The same goes for the read-only
-`.claude-sandbox/` mount, which root can simply remount `rw`. Without the sudo
-default, both are guardrails against accident rather than barriers against a
-prompt-injected or otherwise adversarial agent.
+entrypoint uses to replace it. Without the sudo default, the firewall is a
+guardrail against accident rather than a barrier against a prompt-injected or
+otherwise adversarial agent.
+
+The read-only `.claude-sandbox/` mount is not in that category: it is applied
+by the launcher on the host, and the container is never granted
+`CAP_SYS_ADMIN`, so no process in the guest — root included, `--sudo` or not —
+can remount or unmount it. See [Read-only inside the
+VM](#read-only-inside-the-vm).
 
 The cost is that anything writing outside your home directory fails:
 `apt-get install`, `npm install -g`, `mount`, binding a port below 1024. The
@@ -416,17 +421,25 @@ unreviewed there.
 
 ### Read-only inside the VM
 
-`.claude-sandbox/` is bind-mounted read-only in the guest, so writes to it from
+`.claude-sandbox/` is mounted read-only in the guest, so writes to it from
 inside the VM fail with `EROFS`. Ordinary agent behavior — editing a file,
 running a formatter, an errant `rm` — bounces off it.
 
-**How much of a wall this is depends on the guest.** By default the sandbox
-account cannot become root, so `mount -o remount,rw` is not available to it at
-all. Under [`--sudo`](#root-inside-the-vm) it is one command away, and what the
-mount buys there is only that touching the file takes a deliberate, conspicuous
-act rather than an ordinary write. Either way the control that actually holds
-is the acceptance prompt above: whatever happens in the VM, nothing gets built
-on the host without a human reading a diff first.
+**This one is a wall rather than a guardrail,** unlike the egress firewall. The
+launcher mounts the directory a second time with `:ro`, on top of the project
+mount, so the read-only-ness is enforced host-side by virtiofs rather than by
+anything the guest arranges for itself. Undoing a read-only mount takes
+`CAP_SYS_ADMIN`, and the container is granted only `CAP_NET_ADMIN` — the
+capability is not even in the bounding set, so no process in the guest can
+acquire it. Root under [`--sudo`](#root-inside-the-vm) is no exception:
+`mount`, `remount` and `umount` all return `EPERM` there.
+
+The entrypoint checks the mount arrived and refuses to start `sshd` if it
+didn't, on the same fail-closed rule as the firewall. It does not apply the
+mount itself — it couldn't, for exactly the reason above.
+
+Behind all of it is the acceptance prompt: whatever happens in the VM, nothing
+gets built on the host without a human reading a diff first.
 
 One consequence worth knowing: **a `git checkout`, `pull`, `stash`, or `rebase`
 inside the VM that would change `.claude-sandbox/` fails.** Git only writes
@@ -569,7 +582,7 @@ Three files, one binary:
 | --- | --- |
 | `src/main.rs` | The `claude-sandbox` launcher: name derivation, image build, container lifecycle, readiness polling, ssh-config management |
 | `Dockerfile` | The guest image: Ubuntu 24.04 + Node 22 + Claude Code CLI + `build-essential` + `sshd`, key-only login, and no route to root unless built with `SUDO=1` |
-| `entrypoint.sh` | Runs in the guest at boot: applies the egress firewall, makes `.claude-sandbox/` read-only, starts the idle watchdog, execs `sshd` |
+| `entrypoint.sh` | Runs in the guest at boot: applies the egress firewall, checks `.claude-sandbox/` came up read-only, starts the idle watchdog, execs `sshd` |
 
 `Dockerfile` and `entrypoint.sh` are embedded into the binary with
 `include_str!`, so the release binary is self-contained — **and so editing
@@ -617,8 +630,13 @@ consumes.
    `--no-cache` unless `--use-cache` says otherwise.
 6. **Container** — reuse only a *running* container, and only if it was created
    from the image this run wants; anything else is torn down and recreated.
-   Created with `--rm`, `--cap-add CAP_NET_ADMIN`, and two bind mounts: the
-   project → `~/Projects/<name>`, and `~/.claude-sandbox` → `~/.claude`.
+   Created with `--rm`, `--cap-add CAP_NET_ADMIN`, and bind mounts: the
+   project → `~/Projects/<name>`, `~/.claude-sandbox` → `~/.claude`, and — when
+   the project has one — its `.claude-sandbox/` a second time with `:ro`, laid
+   over the project mount to make the overlay directory read-only in the guest.
+   `CAP_NET_ADMIN` is the only capability added, and `CAP_SYS_ADMIN` in
+   particular is absent, which is what keeps that `:ro` beyond the guest's
+   reach.
 7. **Readiness** — poll for up to 60s, re-reading the IP from
    `container inspect` on every attempt (the runtime assigns it shortly after
    the container appears and can briefly report a previous incarnation's

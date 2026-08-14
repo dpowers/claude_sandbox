@@ -992,8 +992,9 @@ impl Sandbox {
         if self.sudo {
             println!(
                 "--sudo: this VM's account has passwordless root, so nothing enforced \
-                 inside it — the egress firewall, the read-only overlay mount — is a \
-                 barrier to anything running in there"
+                 inside it — the egress firewall — is a barrier to anything running in \
+                 there. The host-side controls hold either way, the read-only overlay \
+                 mount among them."
             );
         }
         let domain = preflight()?;
@@ -1957,7 +1958,20 @@ impl Sandbox {
                 // Read-only in the guest whenever the directory exists, which
                 // is independent of whether this run builds from it: `rebuild`
                 // and --no-overlay change what runs, not what is protected.
+                //
+                // Mounted a second time, with `:ro`, on top of the project
+                // mount. Host-side enforcement is the whole point: undoing it
+                // needs CAP_SYS_ADMIN, which this container is not granted, so
+                // the guard holds even under --sudo where the account is root.
+                // The guest cannot do this for itself — mount(2) is EPERM there
+                // for the same reason — so the entrypoint only checks it landed
+                // and refuses to start sshd if it did not.
                 let overlay_env = format!("OVERLAY_DIR={}/{OVERLAY_DIR}", self.target);
+                let mount_overlay = format!(
+                    "{}:{}/{OVERLAY_DIR}:ro",
+                    self.overlay_src.display(),
+                    self.target
+                );
 
                 let mut args: Vec<&str> = vec![
                     "run",
@@ -1980,7 +1994,14 @@ impl Sandbox {
                 if self.overlay_src.is_dir() {
                     args.extend(["-e", &overlay_env]);
                 }
-                args.extend(["-v", &mount_project, "-v", &mount_claude, image]);
+                args.extend(["-v", &mount_project, "-v", &mount_claude]);
+                // After the project mount it sits inside, so the runtime lays
+                // the two down parent-first; the entrypoint's check is what
+                // catches it if that ever stops being true.
+                if self.overlay_src.is_dir() {
+                    args.extend(["-v", &mount_overlay]);
+                }
+                args.push(image);
                 capture("container", &args)?;
                 let record = self.image_record();
                 if let Some(parent) = record.parent() {

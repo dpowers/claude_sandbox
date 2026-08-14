@@ -37,17 +37,19 @@ RUN userdel -r ubuntu || true
 # sudoers entry. That is what makes the in-guest controls real rather than
 # advisory: the egress firewall is enforced by this VM's own kernel and `nft`
 # needs root to change it, so an agent that decides to reach the LAN has
-# nowhere to go. Same for the read-only overlay mount the entrypoint sets up.
+# nowhere to go.
 # The `sudo` binary is deliberately left installed — attempting it then fails
 # with "is not in the sudoers file" rather than "command not found", which
 # says which of the two situations you are in.
 #
 # SUDO=1 (`claude-sandbox --sudo`) restores passwordless root. It buys
 # `apt-get install`, `npm install -g` and anything else that writes outside
-# $HOME from inside the VM, and it costs every in-guest control: root holds
+# $HOME from inside the VM, and it costs the in-guest controls: root holds
 # CAP_NET_ADMIN here, so `nft delete table inet egress` drops the firewall in
-# one command. Only the host-side controls — the VM boundary, the two mounts,
-# and the overlay acceptance gate — still hold.
+# one command. The host-side controls still hold — the VM boundary, the mounts,
+# and the overlay acceptance gate — and so does the read-only overlay mount,
+# which is host-side too: the container is not granted CAP_SYS_ADMIN, so root
+# in here cannot remount or unmount anything, `--sudo` or not.
 ARG SUDO=0
 RUN useradd -m -u 1000 -s /bin/bash "$USERNAME" \
     && if [ "$SUDO" = 1 ]; then \

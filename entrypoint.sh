@@ -24,8 +24,9 @@
 # these rules live in this VM's own kernel, so anything in here that can
 # become root can also run `nft delete table inet egress`. The image withholds
 # sudo by default for exactly that reason; `claude-sandbox --sudo` hands it
-# back, and with it the ability to undo everything below. The host-side
-# controls — the VM boundary and the two mounts — hold either way.
+# back, and with it the ability to undo this table. The host-side controls —
+# the VM boundary, the mounts, and the read-only overlay mount checked below —
+# hold either way: none of them is this guest's to revoke.
 #
 # Requires NET_ADMIN. Apple's `container` runs each container in its own VM
 # where root keeps that capability; with Docker, run with --cap-add=NET_ADMIN.
@@ -90,24 +91,36 @@ EOF
 # Read-only guard for the project's image-overlay directory. OVERLAY_DIR is the
 # guest path of <project>/.claude-sandbox, whose Dockerfile the launcher builds
 # this VM's image from — so whatever can write it chooses what runs on the
-# host's builder next time. A read-only bind makes ordinary writes from in here
-# fail with EROFS.
+# host's builder next time.
 #
-# This is a wall only as far as the guest stays unprivileged. By default the
-# sandbox account cannot become root, so `mount -o remount,rw` is simply
-# unavailable to it; under `claude-sandbox --sudo` it is one command away, and
-# what the bind buys there is only that reaching the file takes a deliberate,
-# conspicuous act rather than an ordinary write. Either way the control that
-# actually holds is host-side — the launcher will not build contents the host
-# has not seen and accepted.
+# The guard itself is the launcher's: it mounts that directory a second time,
+# with `:ro`, over the project mount. Enforced host-side by virtiofs, which is
+# what makes it a wall rather than a speed bump — undoing a read-only mount
+# needs CAP_SYS_ADMIN, and this container is not granted it (only NET_ADMIN is,
+# for the firewall above). So the guard holds even under `claude-sandbox
+# --sudo`, where the account is root: root without CAP_SYS_ADMIN cannot mount,
+# remount or unmount anything.
+#
+# This script only checks the mount arrived. It used to do the job itself with
+# `mount --bind` + `remount,ro`, which cannot work for the same reason the
+# guarantee now holds — no CAP_SYS_ADMIN, so mount(2) returns EPERM even as
+# uid 0, and `set -e` killed every boot of a project that had an overlay.
 #
 # No directory means nothing to protect (including the race where it is deleted
-# on the host just after launch). A directory that exists but cannot be made
-# read-only is an anomaly, and `set -e` stops the boot rather than starting sshd
-# without the guard — same fail-closed rule as the firewall above.
+# on the host just after launch). A directory that is there but not read-only
+# means the launcher's mount did not take, which is an anomaly: stop the boot
+# rather than start sshd without the guard — same fail-closed rule as the
+# firewall above.
 if [ -n "${OVERLAY_DIR:-}" ] && [ -d "$OVERLAY_DIR" ]; then
-    mount --bind "$OVERLAY_DIR" "$OVERLAY_DIR"
-    mount -o remount,bind,ro "$OVERLAY_DIR"
+    # Field 2 of /proc/mounts is the mount point and field 4 its options. The
+    # guest path is built from a sanitized basename, so it needs no unescaping.
+    if ! awk -v d="$OVERLAY_DIR" '
+        $2 == d { n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] == "ro") ok = 1 }
+        END { exit !ok }' /proc/mounts
+    then
+        echo "entrypoint: $OVERLAY_DIR is not mounted read-only; refusing to start sshd" >&2
+        exit 1
+    fi
 fi
 
 # Idle watchdog: once the last ssh session (Zed remote or shell) has been
