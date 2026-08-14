@@ -688,7 +688,14 @@ fn check_fragment(text: &str) -> Result<String> {
         let trimmed = line.trim();
         let comment = trimmed.starts_with('#');
         let directive = !continued && !trimmed.is_empty() && !comment;
-        continued = !comment && trimmed.ends_with('\\');
+        // A line continues only when a backslash is its final character, as in
+        // Docker's own parser — trailing whitespace after the backslash does
+        // not continue. Checking the raw line rather than the trimmed one keeps
+        // the safe behaviour on `RUN … \ `: the next line is then scanned as a
+        // directive (so a `FROM` on it is caught) instead of skipped as a
+        // continuation. A trailing `\r` is tolerated for CRLF files.
+        let raw = line.strip_suffix('\r').unwrap_or(line);
+        continued = !comment && raw.ends_with('\\');
         if directive {
             let mut tokens = trimmed.split_whitespace();
             if tokens
@@ -985,7 +992,53 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Refuse to launch a VM that would mount the launcher's own state
+    /// directory into the guest.
+    ///
+    /// `state_dir` holds `id_ed25519` — the key authorized in every VM — and
+    /// the accepted-overlay snapshots the gate compares a project against.
+    /// When the project being mounted encloses it (sandboxing `~`, a dotfiles
+    /// repo, or `~/.config`), that directory rides in on the read-write project
+    /// mount, handing both to a guest a prompt-injected agent controls: the key
+    /// reaches every other sandbox, and the snapshots let this one forge its own
+    /// acceptance. A whole-key compromise is too much to answer with a warning
+    /// that scrolls past, so this stops the launch. `CLAUDE_SANDBOX_STATE`
+    /// relocates the state out of the way; the override is for someone who has
+    /// read this and means it.
+    fn refuse_if_state_mounted(&self) -> Result<()> {
+        let state = fs::canonicalize(&self.state_dir).unwrap_or_else(|_| self.state_dir.clone());
+        if !state.starts_with(&self.abs) {
+            return Ok(());
+        }
+        if env_enabled("CLAUDE_SANDBOX_ALLOW_STATE_MOUNT") {
+            eprintln!(
+                "claude-sandbox: warning: {} is inside the mounted project, so the guest can \
+                 read the ssh key every sandbox is reached with and rewrite the \
+                 overlay-acceptance snapshots.\n  \
+                 Proceeding because CLAUDE_SANDBOX_ALLOW_STATE_MOUNT is set.",
+                state.display()
+            );
+            return Ok(());
+        }
+        bail!(
+            "{state} is inside {proj}, which is mounted read-write into the VM.\n  \
+             That would expose the ssh key every sandbox is reached with — and the \
+             overlay-acceptance snapshots — to this guest, so a compromise here would reach \
+             every other sandbox.\n  \
+             move the launcher state outside the project:\n    \
+             CLAUDE_SANDBOX_STATE=<dir outside the project> claude-sandbox ...\n  \
+             or, if this is deliberate and you accept that exposure:\n    \
+             CLAUDE_SANDBOX_ALLOW_STATE_MOUNT=1 claude-sandbox ...",
+            state = state.display(),
+            proj = self.abs.display()
+        );
+    }
+
     fn up(&self, cmd: Cmd, opts: &Opts, ssh_args: &[String]) -> Result<()> {
+        // Before anything is built or mounted: a project that encloses the
+        // launcher's state directory would hand the guest the ssh key and the
+        // overlay-acceptance snapshots on the read-write project mount.
+        self.refuse_if_state_mounted()?;
         // Said on every launch rather than once: this is the one setting that
         // changes what the VM is for, and it can arrive from the environment
         // rather than from the command that was typed.
@@ -1129,13 +1182,18 @@ impl Sandbox {
                 return Ok(());
             }
         }
-        fs::OpenOptions::new()
+        // 0600 because this file holds an auth token. `mode()` only applies
+        // when the file is created, so set_permissions enforces it on a
+        // pre-existing one too; then write through the same handle rather than
+        // reopening.
+        let mut f = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .mode(0o600)
             .open(&dest)?;
-        fs::write(&dest, host.trim_end())?;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600))?;
+        f.write_all(host.trim_end().as_bytes())?;
         println!("seeded Claude credentials into {}", dest.display());
         Ok(())
     }
@@ -1567,26 +1625,11 @@ impl Sandbox {
             return Ok(None);
         }
         // The claim above — that no sandbox can reach it — holds because the
-        // state directory is not one of the two mounts. Sandboxing a directory
-        // that contains it (`~`, a dotfiles repo) breaks that, and a global
-        // overlay the guest can rewrite is exactly what the per-project gate
-        // exists to prevent. Note that this is not the worst of it: that mount
-        // also hands the guest the ssh key every other sandbox is reached with.
-        let state = fs::canonicalize(&self.state_dir).unwrap_or_else(|_| self.state_dir.clone());
-        if state.starts_with(&self.abs) {
-            eprintln!(
-                "claude-sandbox: warning: {} is inside the project being mounted, so the \
-                 VM could rewrite it.\n  Skipping the global overlay for this project.{}",
-                state.display(),
-                if self.key.starts_with(&self.abs) {
-                    "\n  warning: this mount also exposes the ssh key in that directory \
-                     to the guest, which is the key every other sandbox is reached with."
-                } else {
-                    ""
-                }
-            );
-            return Ok(None);
-        }
+        // state directory is not one of the two mounts. A project that encloses
+        // it (`~`, a dotfiles repo) would break that, but `up` refuses to launch
+        // in that case (see refuse_if_state_mounted), so no VM ever runs with
+        // this overlay's source reachable from the guest. `rebuild` reaches here
+        // too and mounts nothing, so it needs no guard of its own.
         let entries = scan_context(&self.global_src)?;
         if !entries.iter().any(|e| e.path == "Dockerfile") {
             println!(
@@ -2233,6 +2276,10 @@ impl Sandbox {
             fs::OpenOptions::new()
                 .create(true)
                 .write(true)
+                // Only reached when the file is absent, so there is nothing to
+                // truncate; stated explicitly to keep the intent (create an
+                // empty 0600 config) unambiguous.
+                .truncate(false)
                 .mode(0o600)
                 .open(&cfg_path)?;
             String::new()

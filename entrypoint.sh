@@ -36,22 +36,25 @@ set -eu
 
 # Exempt port 53 to whatever resolvers the runtime wrote into resolv.conf
 # (normally just the host bridge address; `container run --dns` can override).
-# %zone suffixes are stripped and tokens are restricted to address characters,
-# so a malformed resolv.conf line can neither inject nft syntax nor abort the
-# fail-closed boot.
-dns_v4="" dns_v6=""
-for ns in $(awk '/^nameserver/ { print $2 }' /etc/resolv.conf 2>/dev/null); do
-    ns=${ns%%\%*}
-    case $ns in '' | *[!0-9a-fA-F:.]*) continue ;; esac
-    case $ns in
-        *:*) dns_v6="$dns_v6
-        ip6 daddr $ns udp dport 53 accept
-        ip6 daddr $ns tcp dport 53 accept" ;;
-        *)   dns_v4="$dns_v4
-        ip daddr $ns udp dport 53 accept
-        ip daddr $ns tcp dport 53 accept" ;;
-    esac
-done
+#
+# Each exemption is added after the table below with its own `nft insert`,
+# rather than interpolated into the ruleset. %zone suffixes are stripped and
+# tokens are restricted to address characters, so nothing here can inject nft
+# syntax — and a nameserver that is in-charset but not a valid address (a
+# malformed resolv.conf) now makes only its own rule fail, skipped with a
+# warning, instead of taking the whole ruleset — the rejects included — down
+# with it and aborting this fail-closed boot. Inserted rather than appended so
+# each lands ahead of the private-range reject it is meant to override.
+add_dns_exemption() {
+    _ns=${1%%\%*}
+    case $_ns in '' | *[!0-9a-fA-F:.]*) return ;; esac
+    case $_ns in *:*) _pf=ip6 ;; *) _pf=ip ;; esac
+    for _l4 in udp tcp; do
+        if ! nft insert rule inet egress output "$_pf" daddr "$_ns" "$_l4" dport 53 accept 2>/dev/null; then
+            echo "entrypoint: warning: no DNS exemption for '$_ns' (not a valid address?); it stays blocked" >&2
+        fi
+    done
+}
 
 if nft list table inet egress >/dev/null 2>&1; then
     nft delete table inet egress
@@ -72,7 +75,6 @@ table inet egress {
         # messages keep the link itself working, so they are allowed ahead of
         # the blanket IPv6 reject. Everything else in ICMPv6 is not.
         icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-query, mld-listener-report, mld-listener-reduction, mld2-listener-report, packet-too-big } accept
-${dns_v4}${dns_v6}
 
         # IPv4: new connections to private / CGNAT / link-local / multicast /
         # reserved space are refused; public destinations fall through to the
@@ -87,6 +89,13 @@ ${dns_v4}${dns_v6}
     }
 }
 EOF
+
+# DNS exemptions go in after the table (see add_dns_exemption): a malformed
+# resolver can then only skip its own rule, never abort the boot above. Inserted
+# at the top of the chain, so each sits ahead of the private-range reject.
+for _ns in $(awk '/^nameserver/ { print $2 }' /etc/resolv.conf 2>/dev/null); do
+    add_dns_exemption "$_ns"
+done
 
 # Read-only guard for the project's image-overlay directory. OVERLAY_DIR is the
 # guest path of <project>/.claude-sandbox, whose Dockerfile the launcher builds
