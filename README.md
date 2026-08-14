@@ -103,6 +103,7 @@ With Homebrew — this repository is also its own tap:
 
 ```sh
 brew tap dpowers/claude-sandbox https://github.com/dpowers/claude_sandbox
+brew trust dpowers/claude-sandbox
 brew install claude-sandbox
 ```
 
@@ -112,6 +113,13 @@ for a repository named `homebrew-claude-sandbox`, and this one is called
 do it once, and `brew update` follows it from then on. Homebrew builds from
 source and pulls in Rust as a build dependency (`brew autoremove` drops it
 again later, if you have no other use for it).
+
+The `brew trust` line is not optional either, on Homebrew 6.0 and later: a
+formula from a third-party tap is arbitrary Ruby that runs on your machine, so
+`brew` refuses to load one until you say you have looked at it. Without it,
+`brew install` stops with "Refusing to load formula … from untrusted tap".
+`brew trust --formula dpowers/claude-sandbox/claude-sandbox` trusts just this
+formula rather than anything the tap grows later.
 
 The formula is head-only: there is no release tarball, so `brew install` always
 builds the current `main`. That also means upgrades need `--fetch-HEAD`, because
