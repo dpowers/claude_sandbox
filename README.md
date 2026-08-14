@@ -31,20 +31,22 @@ throwaway Linux VM where:
   exits and `sshd` never starts.
 
 Your Claude Code login is shared across VMs (via `~/.claude-sandbox`), so you
-authenticate once rather than per project.
+authenticate once rather than per project. A project that needs more than the
+base image can carry its own Dockerfile — see [Per-project image
+overlay](#per-project-image-overlay), which is gated behind an explicit
+acceptance step for the same reasons as everything above.
 
 ## Requirements
 
 - **macOS on Apple silicon** with Apple's [`container`](https://github.com/apple/container)
-  CLI (developed against v1.2.2): `brew install container`. Each container gets
-  its own VM, which is what makes the in-guest firewall trustworthy and lets the
+  CLI (developed against v1.2.2; installation below). Each container gets its
+  own VM, which is what makes the in-guest firewall trustworthy and lets the
   guest hold `CAP_NET_ADMIN` without weakening the host.
 - **Rust** (stable, edition 2021) to build the launcher.
 - **[Zed](https://zed.dev)** on the host, with the `zed` CLI on `PATH` — only
-  for the default `up` command; `claude-sandbox shell` needs just `ssh`.
-- **Local DNS for container names** (optional but recommended):
-  `sudo container system dns create container`. Connections are made by pinned
-  IP, so a missing resolver only produces a warning.
+  for the default `up` command; `claude-sandbox shell` needs just `ssh`. Each
+  VM is a host Zed has never seen, so projects open in Restricted Mode until
+  you trust them — see [Restricted Mode](#5-lift-zeds-restricted-mode).
 - **macOS Local Network permission** for the terminal app you launch from:
   System Settings → Privacy & Security → Local Network. VMs live on
   `192.168.64.0/24`; without the grant, connections fail as "No route to host"
@@ -54,18 +56,94 @@ authenticate once rather than per project.
 
 ## Getting started
 
+### 1. Install the `container` CLI
+
+```sh
+brew install container
+container system start      # first start downloads a Linux kernel for the VMs
+```
+
+`container` is Apple's container runtime for Apple silicon; if you prefer not
+to use Homebrew, a signed installer package is available from its
+[releases page](https://github.com/apple/container/releases).
+`container system start` launches its background services — the launcher
+starts them automatically when they're down, so this is a one-time sanity
+check. Verify with `container system status`.
+
+### 2. Create the local DNS domain (optional but recommended)
+
+VMs get hostnames under a local DNS domain served by the runtime. The default
+domain is `container` (the launcher reads it from `[dns] domain` in
+`container system property ls`). Creating it lets ssh and Zed reach VMs by
+name — `claude-sandbox-my-app-a1b2c3.container` — and also writes the
+`/etc/resolver/` entry macOS needs to route those lookups:
+
+```sh
+sudo container system dns create container
+container system dns list        # should now list: container
+```
+
+Skipping this is fine: the launcher pins each VM's IP into its managed ssh
+config, so everything still works — you just get a startup warning and can't
+reach VMs by bare hostname. If name resolution breaks later (say the
+`/etc/resolver/` file went missing), recreate the domain:
+
+```sh
+sudo container system dns delete container
+sudo container system dns create container
+```
+
+### 3. Build the launcher
+
 ```sh
 cargo build --release
 ln -s "$PWD/target/release/claude-sandbox" /usr/local/bin/claude-sandbox
+```
 
+### 4. Run it
+
+```sh
 claude-sandbox ~/Projects/my-app     # first run builds the image (a few minutes)
 ```
+
+The first connection to a VM may trigger the macOS Local Network permission
+prompt for your terminal — allow it, or every later connection fails with
+"No route to host" (see [Requirements](#requirements)).
 
 The VM gets an account named after whoever runs the launcher — your host
 username, lowercased and sanitized for Linux — so the project lands at
 `~/Projects/<name>` inside the VM just as it does on the host. Run `claude`
 there. The first run will prompt you to log in to Claude Code; that login
 persists to `~/.claude-sandbox` on the host and is reused by every later VM.
+
+### 5. Lift Zed's Restricted Mode
+
+Zed opens any worktree it has not been told to trust in **Restricted Mode**:
+language servers and MCP servers are not downloaded or started, and the
+project's `.zed/settings.json` is ignored. Trust is tracked per host, and a
+fresh VM is a host Zed has never seen, so every new sandbox starts restricted.
+
+Two ways out, both host-side:
+
+- **Per project** — click the Restricted Mode indicator in Zed's title bar (or
+  run `workspace::ToggleWorktreeSecurity`) and trust the worktree. Zed stores
+  that against the VM's ssh name, which is derived from the project path and
+  so is identical for every future VM of that project: trust it once and it
+  stays trusted across Zed restarts and VM recreations.
+- **For everything** — add to `~/.config/zed/settings.json`:
+
+  ```json
+  "session": { "trust_all_worktrees": true }
+  ```
+
+  No prompt ever again, at the cost of being global: projects you open
+  locally are auto-trusted too. Auto-trust is not persisted per worktree, so
+  turning the setting back off restores per-project decisions.
+
+Neither knob lives in the VM or in this repo — trust is Zed's own state on the
+host, which is why the launcher can't grant it for you. It prints a note about
+this the first time it opens Zed and then keeps quiet; delete
+`~/.config/claude-sandbox/zed-trust-notice` to see it again.
 
 ### Commands
 
@@ -75,7 +153,33 @@ persists to `~/.claude-sandbox` on the host and is reused by every later VM.
 | `claude-sandbox shell <dir> [cmd…]` | Same, but `ssh` in instead of opening Zed |
 | `claude-sandbox stop <dir>` | Stop the project's VM (it deletes itself on stop) |
 | `claude-sandbox rm <dir>` | Stop and delete the VM, and drop its ssh-config block |
+| `claude-sandbox overlay [action] <dir>` | Inspect or manage the project's [image overlay](#per-project-image-overlay) |
 | `claude-sandbox --rebuild <dir>` | Rebuild the image, recreate the VM, open Zed |
+
+### Options
+
+Accepted before the directory, and (except with `stop`/`rm`, which reject them)
+after it as well. Both `-m 12g` and `--memory=12g` forms work.
+
+| Option | Effect |
+| --- | --- |
+| `-m`, `--memory <size>` | Memory ceiling for the VM, default `8g`. A `K`/`M`/`G`/`T`/`P` suffix is required — the runtime reads a bare number as mebibytes, so `--memory 8` would mean 8 MiB |
+| `-c`, `--cpus <n>` | vCPUs for the VM, default `6`. The runtime adds one vCPU of overhead, so the guest kernel reports `n + 1` |
+| `--rebuild` | Rebuild the image and recreate the VM |
+| `--no-overlay` | Ignore the project's [image overlay](#per-project-image-overlay) for this run and boot the base image |
+| `--accept-overlay` | Accept the overlay's current contents without prompting — for scripts, where there is no one to ask |
+
+`-m`/`-c` are read **when the VM is created**. A running VM keeps the limits it
+was created with, so passing different ones prints a note telling you to
+`claude-sandbox rm <dir>` first rather than silently doing nothing.
+
+The defaults are deliberately not the host's full core count and RAM. There is
+one VM per project, so the ceilings multiply across everything you have open;
+vCPUs are time-sliced against the host anyway, and past the performance-core
+count the guest only schedules onto efficiency cores it cannot tell apart. The
+runtime's own defaults (1 GiB / 4 cpus) are the opposite problem — Claude Code
+is a Node process before `rustc` or a language server starts, and a single link
+step can outgrow the rest of that gigabyte.
 
 ### Environment
 
@@ -85,6 +189,7 @@ persists to `~/.claude-sandbox` on the host and is reused by every later VM.
 | `CLAUDE_SANDBOX_DEBUG` | Keep failed VMs around (skips `--rm`) so `container logs <name>` works |
 | `CLAUDE_SANDBOX_USER` | Account name inside the VM (default: your host username) |
 | `CLAUDE_SANDBOX_STATE` | Override the state directory (default `~/.config/claude-sandbox`) |
+| `CLAUDE_SANDBOX_ACCEPT_OVERLAY` | Accept overlay contents without prompting, same as `--accept-overlay` |
 
 ### Lifecycle
 
@@ -94,6 +199,139 @@ its first connection. Reopening a project recreates it in a couple of seconds �
 these VMs are meant to be disposable, and all durable state lives in the two
 mounts.
 
+## Per-project image overlay
+
+The base image is deliberately thin — Ubuntu, Node, git, the Claude Code CLI.
+When a project needs more than that, put a Dockerfile in the project itself:
+
+```
+<project>/.claude-sandbox/Dockerfile
+```
+
+It is layered **on top of** the base image, so it starts where the base leaves
+off. Write only the extra layers — there is **no `FROM` line**, because the
+launcher supplies it:
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        golang-go postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# The account you ssh in as is available as $USERNAME.
+COPY gitconfig /home/$USERNAME/.gitconfig
+RUN chown "$USERNAME:$USERNAME" "/home/$USERNAME/.gitconfig"
+```
+
+The directory is the build context, so that `COPY` reads
+`.claude-sandbox/gitconfig`. The project itself is *not* in the context — it is
+bind-mounted at run time, long after the image is built — so an overlay can
+install toolchains but cannot bake in your source.
+
+`RUN` executes as **root**, and the file is committed with the project, so a
+team shares one sandbox definition. If you would rather have a file your editor
+and `hadolint` will parse standalone, write `FROM claude-sandbox-base` as the
+first line; the launcher recognizes that placeholder and replaces it. Any other
+`FROM` is rejected — it would start a fresh build stage and silently discard
+the base image, leaving a VM with no `sshd`, no firewall, and no Claude Code.
+
+### Accepting an overlay
+
+An overlay is build instruction that lives in a repository, so opening a
+project would otherwise mean running whatever that repository says to run.
+Nothing is built until you have seen the contents and accepted them:
+
+```
+This project carries an image overlay that has not been accepted:
+
+--- Dockerfile
+    RUN apt-get update && apt-get install -y --no-install-recommends golang-go
+    …
+
+  /Users/you/Projects/my-app/.claude-sandbox/Dockerfile
+
+  These instructions run as root while building this project's VM image.
+  The directory is mounted read-only inside the VM, so a change here is
+  expected to have come from the host.
+
+[a] accept and build  [s] skip  [q] quit >
+```
+
+What you accept is recorded under
+`~/.config/claude-sandbox/overlays/<project>/` — a SHA-256 fingerprint plus a
+byte-for-byte snapshot — and every later launch compares against it. Change
+so much as a flag and the next launch shows you a diff and asks again, this
+time also offering `[r] revert`, which puts the accepted contents back. Bare
+Enter always takes the option that changes nothing.
+
+The whole directory is covered, not just the Dockerfile: a script that the
+Dockerfile `COPY`s and runs is build instruction too, and gating one while
+ignoring the other would be a gate in name only.
+
+Builds run from the accepted snapshot rather than from the project, so the
+bytes handed to the builder are exactly the ones you were shown.
+
+Acceptance is keyed to the project's path, so moving a project or cloning it
+onto another machine asks again — a fresh clone's overlay is genuinely
+unreviewed there.
+
+### Read-only inside the VM
+
+`.claude-sandbox/` is bind-mounted read-only in the guest, so writes to it from
+inside the VM fail with `EROFS`. Ordinary agent behavior — editing a file,
+running a formatter, an errant `rm` — bounces off it.
+
+**This is not a wall.** The sandbox account has passwordless sudo and can
+`mount -o remount,rw` its way past. What the mount buys is that touching the
+file at all takes a deliberate, conspicuous act rather than an ordinary write.
+The control that actually holds is the acceptance prompt above: whatever
+happens in the VM, nothing gets built on the host without a human reading a
+diff first.
+
+One consequence worth knowing: **a `git checkout`, `pull`, `stash`, or `rebase`
+inside the VM that would change `.claude-sandbox/` fails.** Git only writes
+files that differ, so this is confined to moving between branches whose
+overlays differ — which is exactly the case where you would want to re-review
+anyway. Do that operation on the host. (Git otherwise behaves normally in
+there: the files are visible and readable, so nothing looks deleted.)
+
+### Managing overlays
+
+| Command | What it does |
+| --- | --- |
+| `claude-sandbox overlay <dir>` | Status: accepted, changed (with a diff), or never accepted |
+| `claude-sandbox overlay --accept <dir>` | Accept the current contents without launching a VM |
+| `claude-sandbox overlay --revert <dir>` | Restore the last accepted contents into the project |
+| `claude-sandbox overlay --forget <dir>` | Drop the acceptance record and snapshot |
+
+These are pure host-side file operations — they need neither the `container`
+runtime nor a running VM. `claude-sandbox rm` deliberately leaves the record
+alone: it is config you authored, not derived state, and deleting a VM should
+not discard the Dockerfile you wrote for it. `--forget` is how you drop it, and
+it works after the project directory itself is gone.
+
+### Rebuilds
+
+Overlay images are tagged with a fingerprint of the accepted contents and of
+the base image, so "is this image current?" is answered by whether that tag
+exists. Editing the overlay and editing it back costs nothing; rebuilding the
+base invalidates every project's overlay. If a VM is running on an image that
+is no longer current, the launcher says so and recreates it — a couple of
+seconds, and all durable state is in the mounts.
+
+### What an overlay can and cannot do
+
+An overlay runs as root while building the image, so it **can** undo anything
+the base image set up — replace the entrypoint and lose the egress firewall,
+add an authorized key, anything. The launcher re-asserts `USER`, `EXPOSE`, and
+`ENTRYPOINT` after your fragment so that a stray directive cannot strand a VM
+without its firewall by accident, but that is a guard against mistakes, not
+against a hostile overlay, and no amount of generated boilerplate could make it
+one. That is the whole reason the acceptance prompt exists: an overlay is code
+you are choosing to run, and the launcher makes sure it is a choice.
+
+If you would rather not deal with any of this for a particular project, pass
+`--no-overlay` and it boots the base image. The read-only mount still applies.
+
 ## Architecture
 
 Three files, one binary:
@@ -102,7 +340,7 @@ Three files, one binary:
 | --- | --- |
 | `src/main.rs` | The `claude-sandbox` launcher: name derivation, image build, container lifecycle, readiness polling, ssh-config management |
 | `Dockerfile` | The guest image: Ubuntu 24.04 + Node 22 + Claude Code CLI + `sshd`, key-only login, passwordless sudo |
-| `entrypoint.sh` | Runs in the guest at boot: applies the egress firewall, starts the idle watchdog, execs `sshd` |
+| `entrypoint.sh` | Runs in the guest at boot: applies the egress firewall, makes `.claude-sandbox/` read-only, starts the idle watchdog, execs `sshd` |
 
 `Dockerfile` and `entrypoint.sh` are embedded into the binary with
 `include_str!`, so the release binary is self-contained — **and so editing
@@ -122,31 +360,37 @@ consumes.
    from container names doubling as DNS labels.
 3. **Key** — generate a dedicated ed25519 key in `~/.config/claude-sandbox` on
    first use.
-4. **Image** — build `claude-sandbox:<user>` if absent. The account name is
+4. **Overlay** — if the project has a `.claude-sandbox/` directory, read it and
+   compare it against the accepted snapshot, prompting if it is new or changed
+   (see [Per-project image overlay](#per-project-image-overlay)). Asked before
+   anything is built, so "skip" never arrives after a five-minute build.
+5. **Image** — build `claude-sandbox:<user>` if absent. The account name is
    baked into the image, so it goes in the tag: changing `CLAUDE_SANDBOX_USER`
    builds a second image rather than booting one whose only account you can't
    log in as. Authorized keys are the dedicated key plus any `~/.ssh/id_*.pub`,
    joined with a literal `\n` escape that the Dockerfile expands with
    `printf '%b'` (a raw newline in a `--build-arg` value crashes Apple's
-   builder).
-5. **Container** — reuse only a *running* container; anything else is torn down
-   and recreated. Created with `--rm`, `--cap-add CAP_NET_ADMIN`, and two bind
-   mounts: the project → `~/Projects/<name>`, and `~/.claude-sandbox` →
-   `~/.claude`.
-6. **Readiness** — poll for up to 60s, re-reading the IP from
+   builder). An accepted overlay is then built on top as
+   `claude-sandbox:ovl-<project>-<fingerprint>`, from the snapshot rather than
+   from the project directory.
+6. **Container** — reuse only a *running* container, and only if it was created
+   from the image this run wants; anything else is torn down and recreated.
+   Created with `--rm`, `--cap-add CAP_NET_ADMIN`, and two bind mounts: the
+   project → `~/Projects/<name>`, and `~/.claude-sandbox` → `~/.claude`.
+7. **Readiness** — poll for up to 60s, re-reading the IP from
    `container inspect` on every attempt (the runtime assigns it shortly after
    the container appears and can briefly report a previous incarnation's
    address), and TCP-connect to port 22. If the container stops during the
    wait, dump its logs. After ~15 consecutive `EHOSTUNREACH` failures, verify
    `sshd` from inside via `container exec` (which travels over vsock and needs
    no local-network access) and print the Local Network permission hint.
-7. **SSH config** — write a per-container block into
+8. **SSH config** — write a per-container block into
    `~/.config/claude-sandbox/ssh_config` pinning `HostName` to the address that
    actually answered, plus a shared `claude-sandbox-*` defaults block (identity,
    `IdentitiesOnly`, no host-key checking — the host key is new every boot).
    `~/.ssh/config` gets an `Include` line prepended if it doesn't already have
    one. Other projects' blocks are preserved.
-8. **Hand off** — `exec` into `zed ssh://user@host/path`, or into `ssh` for the
+9. **Hand off** — `exec` into `zed ssh://user@host/path`, or into `ssh` for the
    `shell` subcommand.
 
 ### Why connect by IP rather than name
@@ -200,6 +444,10 @@ grace period down to the short idle timeout.
 | --- | --- |
 | `~/.config/claude-sandbox/id_ed25519{,.pub}` | Dedicated SSH key for VM access |
 | `~/.config/claude-sandbox/ssh_config` | Managed host blocks, `Include`d from `~/.ssh/config` |
+| `~/.config/claude-sandbox/zed-trust-notice` | Marker that the Restricted Mode note has been printed |
+| `~/.config/claude-sandbox/overlays/<project>/` | Accepted overlay: `accepted.json` (fingerprint), `accepted/` (snapshot), `build/` (generated context), `built.tag` |
+| `~/.config/claude-sandbox/containers/<name>.image` | Which image a running VM was created from, for the staleness check |
+| `~/.config/claude-sandbox/base-<user>.stamp` | Bumped on every base-image rebuild, so overlays rebuild on top of it |
 | `~/.claude-sandbox/` | Mounted as `~/.claude` in every VM — the persistent Claude Code login and settings |
 
 ## Troubleshooting
@@ -213,5 +461,19 @@ grace period down to the short idle timeout.
 - **`container` subcommands failing with "Operation not permitted"** — the
   `container` CLI does not work under a restrictive command sandbox; run it
   from a normal shell.
-- **Dockerfile edits appear to do nothing** — rebuild the binary
-  (`cargo build --release`); the image sources are compiled in.
+- **No language servers in the VM, "Restricted Mode" in Zed's title bar** —
+  expected on a host Zed hasn't been told to trust; see
+  [step 5](#5-lift-zeds-restricted-mode).
+- **Dockerfile edits appear to do nothing** — for the *base* image
+  (`Dockerfile` in this repo), rebuild the binary (`cargo build --release`);
+  the image sources are compiled in. For a *project's*
+  `.claude-sandbox/Dockerfile`, the launcher picks changes up on the next
+  launch and asks you to accept them — check `claude-sandbox overlay <dir>` if
+  it didn't.
+- **`git checkout` in the VM fails with "Read-only file system"** — the branch
+  you are switching to has a different `.claude-sandbox/`, which is mounted
+  read-only in the guest. Do that checkout on the host; see
+  [Read-only inside the VM](#read-only-inside-the-vm).
+- **"the overlay must be accepted before it is built"** — a non-interactive run
+  hit an unaccepted overlay. Accept it deliberately with
+  `claude-sandbox overlay --accept <dir>`, or pass `--no-overlay`.

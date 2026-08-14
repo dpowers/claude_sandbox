@@ -6,35 +6,88 @@
 // `cargo build` for image rebuilds to pick it up.
 
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io;
+use std::io::{IsTerminal, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const IMAGE_REPO: &str = "claude-sandbox";
 const DOCKERFILE: &str = include_str!("../Dockerfile");
 const ENTRYPOINT: &str = include_str!("../entrypoint.sh");
+
+/// Per-project image overlay: a directory inside the project holding a
+/// Dockerfile (plus anything it COPYs) that is layered on top of the base
+/// image. It is the build context, it is mounted read-only inside the VM, and
+/// it is never built from until the host has accepted its current contents.
+const OVERLAY_DIR: &str = ".claude-sandbox";
+
+/// Ceiling on the overlay build context. Everything under it is read into
+/// memory to fingerprint it, and shipped to the builder on every rebuild, so a
+/// directory this large is a mistake worth naming rather than tolerating.
+const OVERLAY_MAX_BYTES: u64 = 64 << 20;
+
+/// Per-file cap when printing an unaccepted overlay for review. Long enough
+/// for any plausible Dockerfile; short enough that a padded one cannot scroll
+/// the interesting lines off the screen.
+const REVIEW_MAX_LINES: usize = 200;
+
+// The runtime's own defaults (1 GiB / 4 cpus) are sized for a service
+// container, not a dev box: Claude Code is a Node process before rustc or a
+// language server starts, and a single link step can outgrow the rest of that
+// gigabyte. These are per-VM ceilings and there is one VM per project, so they
+// are chosen to leave the host usable with several open at once rather than to
+// match the machine — vCPUs are time-sliced against the host anyway, and past
+// the performance-core count the guest just schedules onto efficiency cores it
+// cannot tell apart. The runtime adds one vCPU of overhead on top, so the
+// guest kernel reports CPUS + 1.
+const DEFAULT_MEMORY: &str = "8g";
+const DEFAULT_CPUS: &str = "6";
 
 const USAGE: &str = "\
 claude-sandbox — run a project directory inside a claude-sandbox VM and open
 Zed on the host connected to it over SSH.
 
 usage:
-  claude-sandbox <dir>                 start the VM (build/create as needed), open Zed
-  claude-sandbox shell <dir> [cmd...]  same, but ssh in instead of opening Zed
-  claude-sandbox stop <dir>            stop the project's VM (it deletes itself on stop)
-  claude-sandbox rm <dir>              stop and delete the project's VM
-  claude-sandbox --rebuild <dir>       rebuild the image, recreate the VM, open Zed
+  claude-sandbox [opts] <dir>                 start the VM (build/create as needed), open Zed
+  claude-sandbox shell [opts] <dir> [cmd...]  same, but ssh in instead of opening Zed
+  claude-sandbox stop <dir>                   stop the project's VM (it deletes itself on stop)
+  claude-sandbox rm <dir>                     stop and delete the project's VM
+  claude-sandbox overlay [action] <dir>       inspect or manage the project's image overlay
+  claude-sandbox --rebuild <dir>              rebuild the image, recreate the VM, open Zed
+
+Options (memory/cpus are read when the VM is created; a running VM keeps the
+limits it was created with, so change them with `rm` first):
+  -m, --memory <size>  memory ceiling, K/M/G/T/P suffix required (default: 8g)
+  -c, --cpus <n>       vCPUs; the guest sees one more than this (default: 6)
+      --rebuild        rebuild the image and recreate the VM
+      --no-overlay     ignore <dir>/.claude-sandbox/Dockerfile for this run
+      --accept-overlay accept the overlay's current contents without prompting
+
+Overlay actions (for `claude-sandbox overlay`):
+  (none)      show status, and a diff if the overlay is unaccepted
+  --accept    accept the current contents
+  --revert    restore the last accepted contents into the project
+  --forget    drop the acceptance record and the stored snapshot
+
+Per-project image overlay:
+  If <dir>/.claude-sandbox/Dockerfile exists it is layered on top of the base
+  image, with that directory as the build context. Its instructions run as root
+  at build time, so nothing is built until you have seen the contents and
+  accepted them; the accepted bytes are recorded under ~/.config/claude-sandbox
+  and any later change re-prompts with a diff. The directory is mounted
+  read-only inside the VM, so writes to it from in there fail.
 
 State:
-  ~/.config/claude-sandbox/   dedicated ssh key + managed ssh config
+  ~/.config/claude-sandbox/   dedicated ssh key, managed ssh config, overlay records
   ~/.claude-sandbox/          mounted as ~/.claude in every VM (Claude login)
 
 A VM deletes itself ~15 seconds after its last ssh session ends (Zed window
@@ -46,6 +99,7 @@ Environment:
   CLAUDE_SANDBOX_DEBUG=1         keep failed VMs around (skips --rm) so `container logs` works
   CLAUDE_SANDBOX_USER=<name>     account inside the VM (default: your host username)
   CLAUDE_SANDBOX_RESEED=1        overwrite the VM's Claude credentials from the host keychain
+  CLAUDE_SANDBOX_ACCEPT_OVERLAY=1  accept overlay contents without prompting (for scripts)
 
 Claude Code inside the VM is seeded from the host on every run: OAuth tokens
 exported from the login Keychain, plus settings.json, CLAUDE.md, agents,
@@ -59,19 +113,173 @@ enum Cmd {
     Shell,
     Stop,
     Rm,
+    Overlay,
+}
+
+/// What `claude-sandbox overlay` was asked to do.
+#[derive(PartialEq, Clone, Copy)]
+enum OverlayAction {
+    Status,
+    Accept,
+    Revert,
+    Forget,
+}
+
+/// Flags accepted before the directory (and, for `up`, after it too). Values
+/// stay `None` when unset so `stop`/`rm` can reject flags that only mean
+/// something at creation time.
+#[derive(Default)]
+struct Opts {
+    rebuild: bool,
+    memory: Option<String>,
+    cpus: Option<String>,
+    no_overlay: bool,
+    accept_overlay: bool,
+    overlay_action: Option<OverlayAction>,
+}
+
+impl Opts {
+    /// Consume leading flags, stopping at the first argument that is not one —
+    /// the directory, or (for `shell`) the start of the ssh command.
+    fn take_from(&mut self, args: &mut VecDeque<String>) -> Result<()> {
+        while let Some(head) = args.front().cloned() {
+            let (name, inline) = match head.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (head.as_str(), None),
+            };
+            match name {
+                "--rebuild" => {
+                    if inline.is_some() {
+                        bail!("--rebuild takes no value");
+                    }
+                    args.pop_front();
+                    self.rebuild = true;
+                }
+                "--memory" | "-m" => {
+                    let v = take_value(args, name, inline)?;
+                    self.memory = Some(parse_memory(&v)?);
+                }
+                "--cpus" | "-c" => {
+                    let v = take_value(args, name, inline)?;
+                    self.cpus = Some(parse_cpus(&v)?);
+                }
+                "--no-overlay" | "--accept-overlay" => {
+                    if inline.is_some() {
+                        bail!("{name} takes no value");
+                    }
+                    args.pop_front();
+                    if name == "--no-overlay" {
+                        self.no_overlay = true;
+                    } else {
+                        self.accept_overlay = true;
+                    }
+                }
+                "--accept" | "--revert" | "--forget" => {
+                    if inline.is_some() {
+                        bail!("{name} takes no value");
+                    }
+                    args.pop_front();
+                    if self.overlay_action.is_some() {
+                        bail!("pick one overlay action: --accept, --revert or --forget");
+                    }
+                    self.overlay_action = Some(match name {
+                        "--accept" => OverlayAction::Accept,
+                        "--revert" => OverlayAction::Revert,
+                        _ => OverlayAction::Forget,
+                    });
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Pull a flag's value, accepting both `--flag value` and `--flag=value`.
+fn take_value(args: &mut VecDeque<String>, flag: &str, inline: Option<String>) -> Result<String> {
+    args.pop_front();
+    match inline {
+        Some(v) => Ok(v),
+        None => args.pop_front().ok_or_else(|| anyhow!("{flag} needs a value")),
+    }
+}
+
+/// Validate a memory ceiling and normalise it for `container -m`. The suffix
+/// is required: the runtime reads a bare number as mebibytes, which turns a
+/// plausible `--memory 8` into 8 MiB rather than the 8 GiB it looks like.
+fn parse_memory(v: &str) -> Result<String> {
+    let s = v.trim().to_lowercase();
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| anyhow!("--memory: expected a size like 8g or 8192m, got: {v}"))?;
+    if n == 0 {
+        bail!("--memory must be greater than 0");
+    }
+    match &s[digits.len()..] {
+        "" => bail!("--memory: {v} needs a unit suffix (K, M, G, T or P), e.g. {v}g"),
+        "k" | "m" | "g" | "t" | "p" | "kb" | "mb" | "gb" | "tb" | "pb" | "kib" | "mib" | "gib"
+        | "tib" | "pib" => Ok(s),
+        other => bail!("--memory: unknown suffix {other:?} in {v} (use K, M, G, T or P)"),
+    }
+}
+
+fn parse_cpus(v: &str) -> Result<String> {
+    let n: u32 =
+        v.trim().parse().map_err(|_| anyhow!("--cpus: expected a whole number, got: {v}"))?;
+    if n == 0 {
+        bail!("--cpus must be at least 1");
+    }
+    Ok(n.to_string())
+}
+
+/// Byte count for a string `parse_memory` accepted, for comparing a request
+/// against what a running VM was created with. Binary units, matching the
+/// runtime: it records `-m 2048mb` as exactly 2 GiB.
+fn memory_bytes(s: &str) -> Option<u64> {
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let n: u64 = digits.parse().ok()?;
+    let mult: u64 = match s[digits.len()..].chars().next() {
+        Some('k') => 1 << 10,
+        Some('m') => 1 << 20,
+        Some('g') => 1 << 30,
+        Some('t') => 1 << 40,
+        Some('p') => 1 << 50,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
+fn human_bytes(b: u64) -> String {
+    if b.is_multiple_of(1 << 30) {
+        format!("{}g", b >> 30)
+    } else {
+        format!("{}m", b >> 20)
+    }
 }
 
 struct Sandbox {
     user: String,
-    image: String,
+    /// The shared image every project starts from, one per guest account.
+    base_image: String,
     home: PathBuf,
     state_dir: PathBuf,
     claude_dir: PathBuf,
     key: PathBuf,
     ssh_conf: PathBuf,
     abs: PathBuf,
+    /// `<sanitized basename>-<6 hex of the path hash>`: the project's identity
+    /// in the container name, the overlay image tag, and the state directory.
+    proj_id: String,
     name: String,
     target: String,
+    /// `<project>/.claude-sandbox` on the host — where the overlay is authored.
+    overlay_src: PathBuf,
+    /// Host-side record for that overlay: the accepted snapshot, its
+    /// fingerprint, and the context the image is actually built from.
+    overlay_state: PathBuf,
+    memory: String,
+    cpus: String,
 }
 
 fn main() {
@@ -105,37 +313,65 @@ fn run() -> Result<()> {
             args.pop_front();
             Cmd::Rm
         }
+        Some("overlay") => {
+            args.pop_front();
+            Cmd::Overlay
+        }
         Some(_) => Cmd::Up,
     };
 
-    let mut rebuild = args.front().is_some_and(|a| a == "--rebuild");
-    if rebuild {
-        args.pop_front();
-    }
+    let mut opts = Opts::default();
+    opts.take_from(&mut args)?;
 
     let Some(dir) = args.pop_front() else {
         eprintln!("{USAGE}");
         std::process::exit(1);
     };
-    let mut ssh_args: Vec<String> = args.into();
-
-    // Only `shell` forwards trailing arguments (to ssh). Elsewhere they are
-    // mistakes — except --rebuild, which is also accepted after the dir.
-    if cmd != Cmd::Shell {
-        for a in ssh_args.drain(..) {
-            if a == "--rebuild" && cmd == Cmd::Up {
-                rebuild = true;
-            } else {
-                bail!("unexpected argument: {a}");
-            }
-        }
+    // take_from stops at the first non-flag, so an unrecognised flag lands
+    // here and would otherwise be reported as the directory.
+    if dir.starts_with('-') {
+        bail!("unknown option: {dir}");
     }
 
-    let sb = Sandbox::new(&dir, cmd)?;
+    // Only `shell` forwards trailing arguments (to ssh). Elsewhere they are
+    // mistakes — except flags, which are also accepted after the dir.
+    let ssh_args: Vec<String> = if cmd == Cmd::Shell {
+        args.into()
+    } else {
+        opts.take_from(&mut args)?;
+        if let Some(a) = args.pop_front() {
+            bail!("unexpected argument: {a}");
+        }
+        Vec::new()
+    };
+
+    // These only take effect while creating something, and neither a VM that
+    // is about to be deleted nor a pure host-side overlay query is that.
+    // Silently ignoring them would look like they had resized an existing VM.
+    if matches!(cmd, Cmd::Stop | Cmd::Rm | Cmd::Overlay) {
+        let what = if cmd == Cmd::Overlay { "overlay" } else { "stop/rm" };
+        if opts.rebuild {
+            bail!("--rebuild has no effect on {what}");
+        }
+        if opts.memory.is_some() || opts.cpus.is_some() {
+            bail!("--memory/--cpus have no effect on {what}");
+        }
+        if opts.no_overlay || opts.accept_overlay {
+            bail!("--no-overlay/--accept-overlay have no effect on {what}");
+        }
+    }
+    // The overlay actions name what `overlay` should do; anywhere else they
+    // would read as a request the launcher silently ignored.
+    if cmd != Cmd::Overlay && opts.overlay_action.is_some() {
+        bail!("--accept/--revert/--forget are actions for `claude-sandbox overlay <dir>`");
+    }
+
+    let sb = Sandbox::new(&dir, cmd, &opts)?;
     match cmd {
         Cmd::Stop => sb.stop(),
         Cmd::Rm => sb.remove(),
-        Cmd::Up | Cmd::Shell => sb.up(cmd, rebuild, &ssh_args),
+        Cmd::Overlay => sb.overlay_cmd(opts.overlay_action.unwrap_or(OverlayAction::Status)),
+        Cmd::Up | Cmd::Shell => sb.up(cmd, &opts, &ssh_args),
     }
 }
 
@@ -162,9 +398,218 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(src, dest)?;
+        // fs::copy carries the source's mode across, and git stores pack files
+        // and loose objects read-only — so a plugin marketplace (a clone) is
+        // seeded fine the first time and then cannot be overwritten on any run
+        // after it. Unlinking is enough: the mode denies writing the file, not
+        // removing it from a directory that is still writable. Only done after
+        // a copy actually fails, so an unwritable destination is never dropped
+        // on the floor for some unrelated reason.
+        let ctx = || format!("copying {} to {}", src.display(), dest.display());
+        if let Err(e) = fs::copy(src, dest) {
+            if e.kind() != io::ErrorKind::PermissionDenied {
+                return Err(e).with_context(ctx);
+            }
+            let _ = fs::remove_file(dest);
+            fs::copy(src, dest).with_context(ctx)?;
+        }
     }
     Ok(())
+}
+
+/// What to do about an overlay the host has not accepted.
+enum Decision {
+    Accept,
+    Revert,
+    Skip,
+    Quit,
+}
+
+/// One file in an overlay build context: its path relative to the context
+/// root, whether it is executable, and its bytes — or, for a symlink, the
+/// target it names.
+#[derive(PartialEq, Eq)]
+struct CtxEntry {
+    path: String,
+    exec: bool,
+    link: bool,
+    data: Vec<u8>,
+}
+
+/// Copy a build context, reproducing symlinks rather than following them.
+///
+/// `copy_tree` resolves them, which is right for seeding config but wrong
+/// here: a snapshot taken that way would not compare equal to what
+/// `scan_context` read, and every accept would fail its own verification. The
+/// destination is expected not to exist (callers clear it first).
+fn copy_context(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let ty = entry.file_type()?;
+        let ctx = || format!("copying {} to {}", from.display(), to.display());
+        if ty.is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(&from)?, &to).with_context(ctx)?;
+        } else if ty.is_dir() {
+            copy_context(&from, &to)?;
+        } else if ty.is_file() {
+            fs::copy(&from, &to).with_context(ctx)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read an overlay build context in full, in a fixed order.
+///
+/// Everything under the directory counts, not just the Dockerfile: a script
+/// the Dockerfile `COPY`s and then runs is build instruction too, and gating
+/// on one file while ignoring the other would be a gate in name only.
+fn scan_context(root: &Path) -> Result<Vec<CtxEntry>> {
+    let mut out = Vec::new();
+    let mut total: u64 = 0;
+    scan_into(root, root, &mut out, &mut total)
+        .with_context(|| format!("reading {}", root.display()))?;
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn scan_into(root: &Path, dir: &Path, out: &mut Vec<CtxEntry>, total: &mut u64) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+        let ty = entry.file_type()?;
+        if ty.is_symlink() {
+            // Recorded as the link, never followed: a link pointing out of the
+            // context would otherwise make the fingerprint cover bytes the
+            // builder never sees, and change without the context changing.
+            let target = fs::read_link(&path)?;
+            out.push(CtxEntry {
+                path: rel,
+                exec: false,
+                link: true,
+                data: target.to_string_lossy().into_owned().into_bytes(),
+            });
+        } else if ty.is_dir() {
+            scan_into(root, &path, out, total)?;
+        } else if ty.is_file() {
+            let meta = entry.metadata()?;
+            *total += meta.len();
+            if *total > OVERLAY_MAX_BYTES {
+                bail!(
+                    "{} holds more than {} MiB. It is read in full to fingerprint it and \
+                     shipped to the builder on every rebuild, so it is meant to hold a \
+                     Dockerfile and the few files it COPYs — not the project.",
+                    root.display(),
+                    OVERLAY_MAX_BYTES >> 20
+                );
+            }
+            out.push(CtxEntry {
+                path: rel,
+                exec: meta.permissions().mode() & 0o111 != 0,
+                link: false,
+                data: fs::read(&path)?,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Fingerprint of a build context: every entry in a fixed order, length-framed
+/// so no two listings can collide by running together.
+///
+/// SHA-256 rather than the md5 used to derive container names — this one is
+/// recorded as "the contents you accepted", which is exactly where a crafted
+/// collision would be aimed. (Acceptance itself compares the bytes, so the
+/// hash is what gets recorded and what names the image, not the gate.)
+fn fingerprint(entries: &[CtxEntry]) -> String {
+    let mut h = Sha256::new();
+    h.update(b"claude-sandbox overlay v1\0");
+    for e in entries {
+        h.update((e.path.len() as u64).to_le_bytes());
+        h.update(e.path.as_bytes());
+        h.update([e.exec as u8, e.link as u8]);
+        h.update((e.data.len() as u64).to_le_bytes());
+        h.update(&e.data);
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Check the project's fragment and return the body to splice into the
+/// generated Dockerfile.
+///
+/// The launcher supplies the `FROM`, so the fragment must not: a second one
+/// starts a fresh build stage, which would silently discard the base image and
+/// produce a VM with no sshd, no firewall and no Claude Code. The one accepted
+/// form is the `claude-sandbox-base` placeholder, which is dropped here — it
+/// exists so people who want a file their editor and linter parse standalone
+/// can have one.
+fn check_fragment(text: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut continued = false;
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        let comment = trimmed.starts_with('#');
+        let directive = !continued && !trimmed.is_empty() && !comment;
+        continued = !comment && trimmed.ends_with('\\');
+        if directive {
+            let mut tokens = trimmed.split_whitespace();
+            if tokens.next().is_some_and(|k| k.eq_ignore_ascii_case("FROM")) {
+                if tokens.next() == Some("claude-sandbox-base") && tokens.next().is_none() {
+                    continue;
+                }
+                bail!(
+                    "{OVERLAY_DIR}/Dockerfile line {}: {trimmed}\n  \
+                     the overlay is layered onto the base image for you, so it must not \
+                     carry its own FROM.\n  \
+                     drop the line, or write `FROM claude-sandbox-base` if you want a \
+                     file that parses standalone.",
+                    n + 1
+                );
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Unified diff of the accepted snapshot against the project's copy. `diff`
+/// exits non-zero precisely when they differ, which is the whole point, so its
+/// status is ignored; if it cannot be run at all, show the current contents
+/// instead — an unreadable prompt is worse than a verbose one.
+fn show_diff(accepted: &Path, current: &Path) {
+    if Command::new("diff").arg("-ruN").arg(accepted).arg(current).status().is_err() {
+        eprintln!("(no `diff` available — showing the current contents in full instead)");
+        if let Ok(entries) = scan_context(current) {
+            show_context(&entries);
+        }
+    }
+}
+
+/// Print a build context for review.
+fn show_context(entries: &[CtxEntry]) {
+    for e in entries {
+        if e.link {
+            println!("--- {} -> {} (symlink)", e.path, String::from_utf8_lossy(&e.data));
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&e.data) else {
+            println!("--- {} ({} bytes, not text)", e.path, e.data.len());
+            continue;
+        };
+        println!("--- {}{}", e.path, if e.exec { " (executable)" } else { "" });
+        let mut lines = text.lines();
+        for line in lines.by_ref().take(REVIEW_MAX_LINES) {
+            println!("    {line}");
+        }
+        let rest = lines.count();
+        if rest > 0 {
+            println!("    … {rest} more lines");
+        }
+    }
 }
 
 /// Absolute path for a directory that may no longer exist: canonicalize the
@@ -195,7 +640,7 @@ fn absolutize_missing(dir: &str) -> Result<PathBuf> {
 }
 
 impl Sandbox {
-    fn new(dir: &str, cmd: Cmd) -> Result<Self> {
+    fn new(dir: &str, cmd: Cmd, opts: &Opts) -> Result<Self> {
         let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
         let user = guest_user()?;
         let state_dir = env::var("CLAUDE_SANDBOX_STATE")
@@ -204,8 +649,9 @@ impl Sandbox {
 
         let abs = if Path::new(dir).is_dir() {
             fs::canonicalize(dir)?
-        } else if matches!(cmd, Cmd::Stop | Cmd::Rm) {
-            // stop/rm must work after the directory is gone.
+        } else if matches!(cmd, Cmd::Stop | Cmd::Rm | Cmd::Overlay) {
+            // stop/rm must work after the directory is gone, and so must
+            // `overlay --forget`, which exists to clean up after exactly that.
             absolutize_missing(dir)?
         } else {
             bail!("not a directory: {dir}");
@@ -233,17 +679,25 @@ impl Sandbox {
             bail!("cannot derive a name from: {}", abs.display());
         }
         let hash = format!("{:x}", md5::compute(abs.to_string_lossy().as_bytes()));
+        let proj_id = format!("{base}-{}", &hash[..6]);
+        let overlay_state = state_dir.join("overlays").join(&proj_id);
+        let overlay_src = abs.join(OVERLAY_DIR);
 
         Ok(Sandbox {
             key: state_dir.join("id_ed25519"),
             ssh_conf: state_dir.join("ssh_config"),
             claude_dir: home.join(".claude-sandbox"),
-            name: format!("claude-sandbox-{base}-{}", &hash[..6]),
+            name: format!("claude-sandbox-{proj_id}"),
             target: format!("/home/{user}/Projects/{base}"),
             // The account is baked into the image, so it belongs in the tag:
             // a different CLAUDE_SANDBOX_USER then builds its own image rather
             // than silently booting one whose only account it cannot log in as.
-            image: format!("{IMAGE_REPO}:{user}"),
+            base_image: format!("{IMAGE_REPO}:{user}"),
+            memory: opts.memory.clone().unwrap_or_else(|| DEFAULT_MEMORY.to_string()),
+            cpus: opts.cpus.clone().unwrap_or_else(|| DEFAULT_CPUS.to_string()),
+            proj_id,
+            overlay_src,
+            overlay_state,
             user,
             home,
             state_dir,
@@ -267,6 +721,10 @@ impl Sandbox {
         let existed = self.state()?.is_some();
         self.destroy();
         self.strip_ssh_block();
+        // The acceptance record survives (it is authored config, not derived
+        // state — `overlay --forget` drops it); only the note of which image
+        // the now-deleted container was created from goes.
+        let _ = fs::remove_file(self.image_record());
         if existed {
             println!("deleted {}", self.name);
         } else {
@@ -306,18 +764,30 @@ impl Sandbox {
         let _ = fs::write(&self.ssh_conf, kept);
     }
 
-    fn up(&self, cmd: Cmd, rebuild: bool, ssh_args: &[String]) -> Result<()> {
+    fn up(&self, cmd: Cmd, opts: &Opts, ssh_args: &[String]) -> Result<()> {
         let domain = preflight()?;
         self.ensure_key()?;
         self.seed_claude_config()?;
-        if rebuild {
+
+        // Ask about the overlay before building anything: the answer decides
+        // which image is wanted, and "skip" should not arrive after a build.
+        let overlay = self.resolve_overlay(opts)?;
+
+        if opts.rebuild || !self.have_image(&self.base_image)? {
             self.build_image()?;
-            if self.state()?.is_some() {
+            // A base rebuild keeps the same tag, so the image-change check in
+            // ensure_container cannot see it; say so explicitly.
+            if opts.rebuild && self.state()?.is_some() {
                 self.destroy();
                 println!("recreating {} with the new image", self.name);
             }
         }
-        self.ensure_container()?;
+        let image = match &overlay {
+            Some(fp) => self.ensure_overlay_image(fp)?,
+            None => self.base_image.clone(),
+        };
+
+        self.ensure_container(&image)?;
         // Connect by IP, not by name: the runtime's DNS record appears some
         // seconds after the container does, and a lookup made in that window
         // gets an NXDOMAIN that macOS then caches — poisoning every retry (and
@@ -335,8 +805,40 @@ impl Sandbox {
             return Err(ssh.exec()).context("failed to exec ssh");
         }
         println!("opening zed on {host} at {}", self.target);
+        self.zed_trust_notice();
         let url = format!("ssh://{}@{host}{}", self.user, self.target);
         Err(Command::new("zed").arg(url).exec()).context("failed to exec zed")
+    }
+
+    /// Zed opens a worktree it has not been told to trust in Restricted Mode:
+    /// no language servers, no MCP servers, and `.zed/settings.json` ignored.
+    /// Trust is recorded against the ssh host name in Zed's own database on
+    /// the host, so the launcher cannot grant it — only Zed can, from the
+    /// title bar or from the one global setting. Say so once and then stay
+    /// out of the way.
+    fn zed_trust_notice(&self) {
+        let notice = self.state_dir.join("zed-trust-notice");
+        if notice.exists() {
+            return;
+        }
+        // Any mention of the setting — `true` or `false` — means the question
+        // has already been answered deliberately; only silence earns the note.
+        let settings = self.home.join(".config/zed/settings.json");
+        let decided = fs::read_to_string(settings).is_ok_and(|s| s.contains("trust_all_worktrees"));
+        if !decided {
+            eprintln!(
+                "claude-sandbox: note: Zed opens each sandbox in Restricted Mode - no language\n  \
+                 servers, no MCP servers, no .zed/settings.json. Lift it from the Restricted\n  \
+                 Mode indicator in Zed's title bar (once per project: the choice is keyed to\n  \
+                 the VM's ssh name, which every future VM for this directory reuses), or for\n  \
+                 every project at once by adding to ~/.config/zed/settings.json:\n\n      \
+                 \"session\": {{ \"trust_all_worktrees\": true }}\n\n  \
+                 That one is global - projects you open locally get trusted too.\n  \
+                 Shown once; delete {} to see it again.",
+                notice.display()
+            );
+        }
+        let _ = fs::write(&notice, "");
     }
 
     /// Seed the VM's ~/.claude (the shared ~/.claude-sandbox mount) from the
@@ -428,7 +930,7 @@ impl Sandbox {
     }
 
     fn build_image(&self) -> Result<()> {
-        println!("building {} ...", self.image);
+        println!("building {} ...", self.base_image);
 
         // Authorize the dedicated key plus any personal keys, so manual ssh
         // works too. Key files are split per line (one file may hold several
@@ -461,17 +963,379 @@ impl Sandbox {
         fs::write(ctx.join("entrypoint.sh"), ENTRYPOINT)?;
         let built = passthrough(
             "container",
-            &["build", "-t", self.image.as_str(),
+            &["build", "-t", self.base_image.as_str(),
               "--build-arg", &format!("SSH_PUBKEY={pubkeys}"),
               "--build-arg", &format!("USERNAME={}", self.user),
               &ctx.to_string_lossy()],
         );
         let _ = fs::remove_dir_all(&ctx);
-        built
+        built?;
+        self.bump_base_stamp()
     }
 
-    fn have_image(&self) -> Result<bool> {
-        Ok(capture("container", &["image", "inspect", self.image.as_str()]).is_ok())
+    fn have_image(&self, tag: &str) -> Result<bool> {
+        Ok(capture("container", &["image", "inspect", tag]).is_ok())
+    }
+
+    /// A value that changes every time the base image is actually rebuilt.
+    ///
+    /// Overlay images sit on top of the base, so a base rebuild leaves every
+    /// project's overlay stale — but the base keeps its tag across rebuilds,
+    /// so the tag cannot say so. Folding this stamp into each overlay's tag
+    /// makes any base rebuild, from any project, invalidate them all.
+    fn base_stamp_path(&self) -> PathBuf {
+        self.state_dir.join(format!("base-{}.stamp", self.user))
+    }
+
+    fn base_stamp(&self) -> Result<String> {
+        if let Ok(s) = fs::read_to_string(self.base_stamp_path()) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                return Ok(s);
+            }
+        }
+        // No stamp yet: an image built before this existed, or a fresh state
+        // directory. Adopt a fixed value rather than a fresh one, so merely
+        // reading it can never look like a rebuild.
+        fs::create_dir_all(&self.state_dir)?;
+        fs::write(self.base_stamp_path(), "0\n")?;
+        Ok("0".to_string())
+    }
+
+    fn bump_base_stamp(&self) -> Result<()> {
+        let n = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        fs::create_dir_all(&self.state_dir)?;
+        fs::write(self.base_stamp_path(), format!("{n}\n"))?;
+        Ok(())
+    }
+
+    // ---- Per-project image overlay ---------------------------------------
+
+    /// The snapshot of the overlay contents the host has accepted. It is both
+    /// the thing a change is diffed against and the context builds run from.
+    fn overlay_snapshot(&self) -> PathBuf {
+        self.overlay_state.join("accepted")
+    }
+
+    fn overlay_record(&self) -> PathBuf {
+        self.overlay_state.join("accepted.json")
+    }
+
+    /// Decide whether this run has an overlay to build, prompting when the
+    /// project's overlay directory is new or has changed since it was last
+    /// accepted. Returns the accepted contents' fingerprint.
+    fn resolve_overlay(&self, opts: &Opts) -> Result<Option<String>> {
+        if !self.overlay_src.is_dir() {
+            return Ok(None);
+        }
+        if opts.no_overlay {
+            println!("--no-overlay: ignoring {}", self.overlay_src.display());
+            return Ok(None);
+        }
+        let current = scan_context(&self.overlay_src)?;
+        if !current.iter().any(|e| e.path == "Dockerfile") {
+            println!(
+                "note: {} has no Dockerfile, so no image overlay is applied\n  \
+                 (the directory is still mounted read-only inside the VM)",
+                self.overlay_src.display()
+            );
+            return Ok(None);
+        }
+
+        let snap = self.overlay_snapshot();
+        let accepted = if snap.is_dir() { Some(scan_context(&snap)?) } else { None };
+        // Compared byte for byte rather than by fingerprint: the hash is what
+        // gets recorded and what names the image, but the gate itself owes
+        // nothing to the hash function holding up.
+        if accepted.as_deref() == Some(&current[..]) {
+            return Ok(Some(fingerprint(&current)));
+        }
+
+        if opts.accept_overlay || env::var_os("CLAUDE_SANDBOX_ACCEPT_OVERLAY").is_some() {
+            return Ok(Some(self.accept_overlay(&current)?));
+        }
+        match self.prompt_overlay(&current, accepted.is_some())? {
+            Decision::Accept => Ok(Some(self.accept_overlay(&current)?)),
+            Decision::Revert => {
+                self.revert_overlay()?;
+                Ok(Some(fingerprint(&scan_context(&self.overlay_src)?)))
+            }
+            Decision::Skip => {
+                println!("skipping the overlay: this VM boots the base image");
+                Ok(None)
+            }
+            Decision::Quit => bail!("aborted"),
+        }
+    }
+
+    /// Record the overlay's current contents as accepted: snapshot the bytes
+    /// (so later changes can be diffed and reverted, and so builds read a copy
+    /// the VM cannot reach) and write the fingerprint alongside them.
+    fn accept_overlay(&self, current: &[CtxEntry]) -> Result<String> {
+        let snap = self.overlay_snapshot();
+        fs::create_dir_all(&self.overlay_state)?;
+        if snap.exists() {
+            fs::remove_dir_all(&snap)?;
+        }
+        copy_context(&self.overlay_src, &snap)
+            .with_context(|| format!("snapshotting {}", self.overlay_src.display()))?;
+        // Close the gap between "these are the bytes you were shown" and
+        // "these are the bytes that were stored": a write landing in between
+        // would otherwise be accepted without ever having been displayed.
+        if scan_context(&snap)? != current {
+            fs::remove_dir_all(&snap)?;
+            bail!(
+                "{} changed while it was being accepted; nothing was recorded",
+                self.overlay_src.display()
+            );
+        }
+
+        let fp = fingerprint(current);
+        let at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let record = serde_json::json!({
+            "fingerprint": fp,
+            "project": self.abs.to_string_lossy(),
+            "accepted_at": at,
+        });
+        fs::write(self.overlay_record(), format!("{}\n", serde_json::to_string_pretty(&record)?))?;
+        println!("accepted the image overlay for {} ({}…)", self.abs.display(), &fp[..12]);
+        Ok(fp)
+    }
+
+    /// Put the accepted contents back, dropping anything the working copy
+    /// added. The snapshot is the source of truth, so the destination is
+    /// replaced wholesale rather than merged — and it stays intact throughout,
+    /// so a failure part-way through loses nothing that cannot be retried.
+    fn revert_overlay(&self) -> Result<()> {
+        let snap = self.overlay_snapshot();
+        if !snap.is_dir() {
+            bail!("nothing to revert to: no accepted overlay recorded for {}", self.abs.display());
+        }
+        // Restoring into a project that is no longer there would conjure the
+        // directory back into existence holding nothing but the overlay.
+        if !self.abs.is_dir() {
+            bail!("cannot revert: {} does not exist", self.abs.display());
+        }
+        if self.overlay_src.exists() {
+            fs::remove_dir_all(&self.overlay_src)?;
+        }
+        copy_context(&snap, &self.overlay_src)?;
+        println!("reverted {} to the accepted contents", self.overlay_src.display());
+        Ok(())
+    }
+
+    /// Show what is being asked about and read a decision.
+    fn prompt_overlay(&self, current: &[CtxEntry], have_accepted: bool) -> Result<Decision> {
+        if have_accepted {
+            println!("\nThe image overlay for this project has changed since you accepted it:\n");
+            show_diff(&self.overlay_snapshot(), &self.overlay_src);
+        } else {
+            println!("\nThis project carries an image overlay that has not been accepted:\n");
+            show_context(current);
+        }
+        println!(
+            "\n  {}\n\n  \
+             These instructions run as root while building this project's VM image.\n  \
+             The directory is mounted read-only inside the VM, so a change here is\n  \
+             expected to have come from the host.\n",
+            self.overlay_src.display()
+        );
+
+        // Never block on a prompt nobody can answer — but only after printing
+        // the above, so a log from a non-interactive run still shows why.
+        if !io::stdin().is_terminal() {
+            bail!(
+                "the overlay must be accepted before it is built, and there is no \
+                 terminal to ask on.\n  \
+                 review and accept it with:  claude-sandbox overlay --accept {}\n  \
+                 or ignore it with:          --no-overlay",
+                self.abs.display()
+            );
+        }
+        loop {
+            if have_accepted {
+                print!("[a] accept and build  [r] revert to accepted  [s] skip  [q] quit > ");
+            } else {
+                print!("[a] accept and build  [s] skip  [q] quit > ");
+            }
+            io::stdout().flush()?;
+            let mut line = String::new();
+            // EOF mid-prompt is not consent.
+            if io::stdin().read_line(&mut line)? == 0 {
+                println!();
+                return Ok(Decision::Quit);
+            }
+            match line.trim().to_ascii_lowercase().as_str() {
+                "a" | "accept" => return Ok(Decision::Accept),
+                "r" | "revert" if have_accepted => return Ok(Decision::Revert),
+                // Bare Enter takes the option that changes nothing.
+                "" | "s" | "skip" => return Ok(Decision::Skip),
+                "q" | "quit" => return Ok(Decision::Quit),
+                other => println!("  not one of the options: {other:?}"),
+            }
+        }
+    }
+
+    /// Build (or reuse) the image for an accepted overlay.
+    ///
+    /// The tag carries a fingerprint of the accepted contents and of the base
+    /// image's build stamp, so "is this image current?" is answered by whether
+    /// the tag exists: editing the overlay and editing it back costs nothing,
+    /// and a base rebuild invalidates it. No bookkeeping to go stale, and it
+    /// heals itself if images are pruned by hand.
+    fn ensure_overlay_image(&self, content_fp: &str) -> Result<String> {
+        let mut h = Sha256::new();
+        h.update(content_fp.as_bytes());
+        h.update([0]);
+        h.update(self.base_image.as_bytes());
+        h.update([0]);
+        h.update(self.base_stamp()?.as_bytes());
+        let tag = format!("{IMAGE_REPO}:ovl-{}-{}", self.proj_id, &format!("{:x}", h.finalize())[..8]);
+        if self.have_image(&tag)? {
+            return Ok(tag);
+        }
+
+        let snap = self.overlay_snapshot();
+        let fragment = fs::read_to_string(snap.join("Dockerfile"))
+            .with_context(|| format!("reading {}", snap.join("Dockerfile").display()))?;
+        let body = check_fragment(&fragment)?;
+
+        // Built from the accepted snapshot rather than from the project, so
+        // the bytes handed to the builder are exactly the ones that were shown
+        // and accepted, with no window in between for them to change.
+        let build = self.overlay_state.join("build");
+        if build.exists() {
+            fs::remove_dir_all(&build)?;
+        }
+        copy_context(&snap, &build)?;
+        // Overwrites the copy of the project's own Dockerfile: the build reads
+        // the generated one, and the original stays intact in `accepted/`.
+        fs::write(build.join("Dockerfile"), self.generated_dockerfile(&body))?;
+
+        println!("building {tag} from {} ...", self.overlay_src.display());
+        passthrough(
+            "container",
+            &["build", "-t", &tag,
+              "--build-arg", &format!("USERNAME={}", self.user),
+              &build.to_string_lossy()],
+        )
+        .with_context(|| format!("building the image overlay from {}", self.overlay_src.display()))?;
+        self.prune_overlay_images(&tag);
+        Ok(tag)
+    }
+
+    /// The Dockerfile actually built: the project's fragment with a `FROM` in
+    /// front of it and the directives that must survive it behind.
+    fn generated_dockerfile(&self, body: &str) -> String {
+        format!(
+            "# Generated by claude-sandbox from {src}/Dockerfile.\n\
+             # Edit that file, not this one — this copy is rewritten every build.\n\
+             FROM {base}\n\
+             # ARG does not survive FROM, so it is re-declared for the fragment.\n\
+             ARG USERNAME={user}\n\
+             USER root\n\
+             # ---- begin project overlay ----\n\
+             {body}\
+             # ---- end project overlay ----\n\
+             # Re-asserted after the fragment (last one wins) so a stray directive in it\n\
+             # cannot leave the VM without the entrypoint that installs the egress\n\
+             # firewall. This is a guard against accident, not against a hostile overlay:\n\
+             # the fragment runs as root and can rewrite anything the base image set up,\n\
+             # which is why it is not built until the host has accepted it.\n\
+             USER root\n\
+             EXPOSE 22\n\
+             ENTRYPOINT [\"/usr/local/bin/entrypoint.sh\"]\n",
+            src = self.overlay_src.display(),
+            base = self.base_image,
+            user = self.user,
+        )
+    }
+
+    /// Drop the tag the previous overlay build produced. Overlay tags are
+    /// content-addressed, so an old one is never reused and they would
+    /// otherwise accumulate one per edit; only the layers unique to them are
+    /// freed, since the base underneath is shared.
+    fn prune_overlay_images(&self, keep: &str) {
+        let marker = self.overlay_state.join("built.tag");
+        if let Ok(prev) = fs::read_to_string(&marker) {
+            let prev = prev.trim();
+            // Two spellings because the runtime's is the one that matters and
+            // this is best-effort cleanup either way.
+            if !prev.is_empty()
+                && prev != keep
+                && capture("container", &["image", "rm", prev]).is_err()
+            {
+                let _ = capture("container", &["image", "delete", prev]);
+            }
+        }
+        let _ = fs::write(&marker, format!("{keep}\n"));
+    }
+
+    /// `claude-sandbox overlay [action] <dir>` — all host-side, so it needs
+    /// neither the runtime nor a VM.
+    fn overlay_cmd(&self, action: OverlayAction) -> Result<()> {
+        match action {
+            OverlayAction::Revert => self.revert_overlay(),
+            OverlayAction::Forget => {
+                if self.overlay_state.exists() {
+                    fs::remove_dir_all(&self.overlay_state)?;
+                    println!("forgot the overlay record for {}", self.abs.display());
+                } else {
+                    println!("no overlay record for {}", self.abs.display());
+                }
+                Ok(())
+            }
+            OverlayAction::Accept => {
+                if !self.overlay_src.is_dir() {
+                    bail!("nothing to accept: {} does not exist", self.overlay_src.display());
+                }
+                self.accept_overlay(&scan_context(&self.overlay_src)?)?;
+                Ok(())
+            }
+            OverlayAction::Status => self.overlay_status(),
+        }
+    }
+
+    fn overlay_status(&self) -> Result<()> {
+        println!("overlay:  {}", self.overlay_src.display());
+        println!("record:   {}", self.overlay_state.display());
+        if !self.overlay_src.is_dir() {
+            println!("status:   absent — this project boots the base image unchanged");
+            return Ok(());
+        }
+        let current = scan_context(&self.overlay_src)?;
+        let snap = self.overlay_snapshot();
+        let accepted = if snap.is_dir() { Some(scan_context(&snap)?) } else { None };
+        match accepted {
+            Some(ref a) if a == &current => {
+                println!("status:   accepted ({}…)", &fingerprint(&current)[..12]);
+            }
+            Some(_) => {
+                println!("status:   CHANGED since it was accepted\n");
+                show_diff(&snap, &self.overlay_src);
+                println!(
+                    "\naccept with:  claude-sandbox overlay --accept {}\
+                     \nrevert with:  claude-sandbox overlay --revert {}",
+                    self.abs.display(),
+                    self.abs.display()
+                );
+            }
+            None => {
+                println!("status:   NEW — never accepted\n");
+                show_context(&current);
+                println!("\naccept with:  claude-sandbox overlay --accept {}", self.abs.display());
+            }
+        }
+        if !current.iter().any(|e| e.path == "Dockerfile") {
+            println!("\nnote: there is no Dockerfile here, so no image overlay is built.");
+        }
+        Ok(())
     }
 
     /// None = the container does not exist. Other inspect failures (daemon
@@ -493,7 +1357,64 @@ impl Sandbox {
         Ok(v[0]["status"]["state"].as_str().map(String::from))
     }
 
-    fn ensure_container(&self) -> Result<()> {
+    /// (cpus, memory bytes) the VM was actually created with.
+    fn resources(&self) -> Option<(u64, u64)> {
+        let out = capture("container", &["inspect", &self.name]).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+        let r = &v[0]["configuration"]["resources"];
+        Some((r["cpus"].as_u64()?, r["memoryInBytes"].as_u64()?))
+    }
+
+    /// Limits are fixed when the VM is created, and a running one is reused as
+    /// is, so `-m`/`-c` on an already-open project would otherwise do nothing
+    /// at all — quietly, which reads as though the resize took.
+    fn warn_if_limits_differ(&self) {
+        let Some((cpus, mem)) = self.resources() else {
+            return;
+        };
+        let want_cpus: u64 = self.cpus.parse().unwrap_or(cpus);
+        let want_mem = memory_bytes(&self.memory).unwrap_or(mem);
+        if (cpus, mem) == (want_cpus, want_mem) {
+            return;
+        }
+        println!(
+            "note: {} is already running with {cpus} cpus / {} — limits are set at \
+             creation.\n  to run it with {} cpus / {}:  claude-sandbox rm {}",
+            self.name,
+            human_bytes(mem),
+            self.cpus,
+            self.memory,
+            self.abs.display()
+        );
+    }
+
+    /// Where the tag a container was created from is noted, for the staleness
+    /// check in `ensure_container`.
+    fn image_record(&self) -> PathBuf {
+        self.state_dir.join("containers").join(format!("{}.image", self.name))
+    }
+
+    /// The image a running container was created from, or None if it cannot be
+    /// established. `inspect` is authoritative when it carries the reference;
+    /// the note written at creation covers the case where it does not.
+    fn container_image(&self) -> Option<String> {
+        if let Ok(out) = capture("container", &["inspect", &self.name]) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) {
+                let cfg = &v[0]["configuration"];
+                for node in [&cfg["image"]["reference"], &cfg["image"], &v[0]["image"]] {
+                    if let Some(s) = node.as_str() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+        fs::read_to_string(self.image_record())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn ensure_container(&self, image: &str) -> Result<()> {
         // Only a running container is reused. Anything else is torn down and
         // recreated (~2s): these VMs are ephemeral by design — all state lives
         // in the two mounts — and restarting one churns its address, which the
@@ -503,13 +1424,26 @@ impl Sandbox {
             self.destroy();
             state = None;
         }
-        match state.as_deref() {
-            Some("running") => Ok(()),
-            None => {
-                if !self.have_image()? {
-                    self.build_image()?;
+        // A running VM was built from whatever image was current when it
+        // started, so an overlay edited since then has not taken effect.
+        // Recreating costs seconds and is what "I changed my Dockerfile" asks
+        // for; an unknown previous image is left alone rather than churning
+        // every launch, and resolves itself once one has been recorded.
+        if state.as_deref() == Some("running") {
+            if let Some(prev) = self.container_image() {
+                if prev != image {
+                    println!("image changed ({prev} -> {image}) — recreating {}", self.name);
+                    self.destroy();
+                    state = None;
                 }
-
+            }
+        }
+        match state.as_deref() {
+            Some("running") => {
+                self.warn_if_limits_differ();
+                Ok(())
+            }
+            None => {
                 let idle = match env::var("CLAUDE_SANDBOX_IDLE") {
                     Ok(v) => {
                         v.parse::<u64>().map_err(|_| {
@@ -523,18 +1457,47 @@ impl Sandbox {
                 let mount_project = format!("{}:{}", self.abs.display(), self.target);
                 let mount_claude =
                     format!("{}:/home/{}/.claude", self.claude_dir.display(), self.user);
+                // Read-only in the guest whenever the directory exists, which
+                // is independent of whether this run builds from it: --rebuild
+                // and --no-overlay change what runs, not what is protected.
+                let overlay_env = format!("OVERLAY_DIR={}/{OVERLAY_DIR}", self.target);
 
-                let mut args: Vec<&str> =
-                    vec!["run", "-d", "--name", &self.name, "--cap-add", "CAP_NET_ADMIN"];
+                let mut args: Vec<&str> = vec![
+                    "run",
+                    "-d",
+                    "--name",
+                    &self.name,
+                    "--cap-add",
+                    "CAP_NET_ADMIN",
+                    "-m",
+                    &self.memory,
+                    "-c",
+                    &self.cpus,
+                ];
                 if !debug {
                     args.push("--rm");
                 }
                 if let Some(e) = idle.as_deref() {
                     args.extend(["-e", e]);
                 }
-                args.extend(["-v", &mount_project, "-v", &mount_claude, self.image.as_str()]);
+                if self.overlay_src.is_dir() {
+                    args.extend(["-e", &overlay_env]);
+                }
+                args.extend(["-v", &mount_project, "-v", &mount_claude, image]);
                 capture("container", &args)?;
-                println!("created {} ({} -> {})", self.name, self.abs.display(), self.target);
+                let record = self.image_record();
+                if let Some(parent) = record.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&record, format!("{image}\n"))?;
+                println!(
+                    "created {} ({} cpus, {} memory) ({} -> {})",
+                    self.name,
+                    self.cpus,
+                    self.memory,
+                    self.abs.display(),
+                    self.target
+                );
                 Ok(())
             }
             Some(other) => bail!("container {} is in unexpected state: {other}", self.name),

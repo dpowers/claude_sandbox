@@ -80,6 +80,27 @@ ${dns_v4}${dns_v6}
 }
 EOF
 
+# Read-only guard for the project's image-overlay directory. OVERLAY_DIR is the
+# guest path of <project>/.claude-sandbox, whose Dockerfile the launcher builds
+# this VM's image from — so whatever can write it chooses what runs on the
+# host's builder next time. A read-only bind makes ordinary writes from in here
+# fail with EROFS.
+#
+# This is not a wall: the sandbox account has passwordless sudo and can remount
+# it rw. What it buys is that reaching the file at all takes a deliberate,
+# conspicuous act rather than an ordinary write. The control that actually
+# holds is host-side — the launcher will not build contents the host has not
+# seen and accepted.
+#
+# No directory means nothing to protect (including the race where it is deleted
+# on the host just after launch). A directory that exists but cannot be made
+# read-only is an anomaly, and `set -e` stops the boot rather than starting sshd
+# without the guard — same fail-closed rule as the firewall above.
+if [ -n "${OVERLAY_DIR:-}" ] && [ -d "$OVERLAY_DIR" ]; then
+    mount --bind "$OVERLAY_DIR" "$OVERLAY_DIR"
+    mount -o remount,bind,ro "$OVERLAY_DIR"
+fi
+
 # Idle watchdog: once the last ssh session (Zed remote or shell) has been
 # gone for IDLE_TIMEOUT seconds, kill PID 1 (sshd) so the container stops —
 # and, because the launcher creates containers with --rm, is deleted. A fresh
