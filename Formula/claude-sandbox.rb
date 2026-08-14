@@ -5,12 +5,15 @@
 # explicitly instead of deriving it from the tap name:
 #
 #   brew tap dpowers/claude-sandbox https://github.com/dpowers/claude_sandbox
-#   brew install claude-sandbox
+#   brew trust dpowers/claude-sandbox
+#   brew install --HEAD claude-sandbox
 #
 # The formula is head-only on purpose: there is no `url`/`sha256` pair naming a
-# release tarball, so `brew install` always builds the current `main` and a
-# release is just a push. The cost is that `brew upgrade` skips HEAD kegs unless
-# it is told to re-check the remote — see the caveats below.
+# release tarball, so an install always builds the current `main` and a release
+# is just a push. Two costs, both in the caveats below: `--HEAD` is required on
+# the install (Homebrew 6 refuses a bare `brew install` for a head-only formula
+# rather than inferring it), and `brew upgrade` skips HEAD kegs unless told to
+# re-check the remote.
 class ClaudeSandbox < Formula
   # Kept short on purpose: Homebrew caps "<name>: <desc>" at 80 characters.
   desc "Disposable, network-restricted VM per project, with Claude Code"
@@ -20,7 +23,23 @@ class ClaudeSandbox < Formula
   # No livecheck block: it exists to spot new stable releases, and a head-only
   # formula has no stable version to compare against.
 
-  depends_on "rust" => :build
+  # Where rustup puts its shims, honouring CARGO_HOME the way rustup itself
+  # does. Resolved at load time, while the real HOME is still in scope: the
+  # build runs with HOME pointed at a sandbox temp dir, so `~` cannot be
+  # expanded from inside `install`.
+  CARGO_BIN = File.expand_path("#{ENV.fetch("CARGO_HOME", "~/.cargo")}/bin").freeze
+  RUSTUP_CARGO = "#{CARGO_BIN}/cargo".freeze
+
+  # Homebrew resolves `depends_on` against its own prefix and ignores rustup on
+  # purpose — a formula's build is meant to be reproducible from Homebrew-managed
+  # inputs alone. That costs a machine with a working `~/.cargo/bin/cargo` a
+  # second Rust plus its runtime tail (llvm, python, z3, …), several GB to
+  # duplicate a compiler that is already there. This tap is personal, so prefer
+  # the toolchain on the machine and fall back to the brewed one when there is
+  # none. The trade-off is accepted knowingly: the build now depends on whatever
+  # rustup's default toolchain happens to be, so an old or broken one surfaces
+  # here as a `brew install` failure. `brew audit` would object; it is not run.
+  depends_on "rust" => :build unless File.executable?(RUSTUP_CARGO)
   # Every VM is an Apple `container` VM, which exists on Apple silicon only.
   depends_on arch: :arm64
   depends_on :macos
@@ -29,6 +48,10 @@ class ClaudeSandbox < Formula
   # entrypoint.sh are `include_str!`d into it at compile time — so there is
   # nothing to install but the executable.
   def install
+    # superenv strips PATH back to Homebrew's own bin dirs, so rustup's shims
+    # are invisible during the build unless they are put back. Harmless when the
+    # brewed Rust is in play: that one is earlier in PATH regardless.
+    ENV.prepend_path "PATH", CARGO_BIN if File.executable?(RUSTUP_CARGO)
     system "cargo", "install", *std_cargo_args
   end
 
@@ -38,6 +61,9 @@ class ClaudeSandbox < Formula
       because there is no version number to compare. To pick up new commits:
 
         brew upgrade --fetch-HEAD claude-sandbox
+
+      Rust came from `~/.cargo/bin` if rustup had put one there, and from the
+      `rust` formula otherwise — `brew install` would have said so either way.
 
       claude-sandbox drives Apple's `container` CLI, which is deliberately not a
       formula dependency: an existing install from Apple's signed .pkg would end

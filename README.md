@@ -45,8 +45,9 @@ behind an explicit acceptance step, for the same reasons as everything above.
   CLI (developed against v1.2.2; installation below). Each container gets its
   own VM, which is what makes the in-guest firewall trustworthy and lets the
   guest hold `CAP_NET_ADMIN` without weakening the host.
-- **Rust** (stable, edition 2021) to build the launcher — Homebrew installs it
-  for you if you go that route.
+- **Rust** (stable, edition 2021) to build the launcher. A rustup toolchain in
+  `~/.cargo/bin` is used if you have one; Homebrew installs its own only when
+  you don't.
 - **[Zed](https://zed.dev)** on the host, with the `zed` CLI on `PATH` — only
   for the default `up` command; `claude-sandbox shell` needs just `ssh`. Each
   VM is a host Zed has never seen, so projects open in Restricted Mode until
@@ -104,7 +105,7 @@ With Homebrew — this repository is also its own tap:
 ```sh
 brew tap dpowers/claude-sandbox https://github.com/dpowers/claude_sandbox
 brew trust dpowers/claude-sandbox
-brew install claude-sandbox
+brew install --HEAD claude-sandbox
 ```
 
 The URL is not optional: the short `brew tap dpowers/claude-sandbox` form looks
@@ -121,14 +122,24 @@ formula from a third-party tap is arbitrary Ruby that runs on your machine, so
 `brew trust --formula dpowers/claude-sandbox/claude-sandbox` trusts just this
 formula rather than anything the tap grows later.
 
-The formula is head-only: there is no release tarball, so `brew install` always
-builds the current `main`. That also means upgrades need `--fetch-HEAD`, because
-plain `brew upgrade` skips HEAD installs — there is no version number for it to
-compare against:
+The formula is head-only: there is no release tarball, so an install always
+builds the current `main`. Hence `--HEAD` — Homebrew 6 refuses a bare `brew
+install` on a head-only formula ("is a HEAD-only formula. To install it, run:
+…") rather than inferring the only thing it could have meant. For the same
+reason upgrades need `--fetch-HEAD`, since plain `brew upgrade` skips HEAD
+installs — there is no version number for it to compare against:
 
 ```sh
 brew upgrade --fetch-HEAD claude-sandbox
 ```
+
+Rust is only pulled in if you don't already have it. Homebrew normally ignores
+non-Homebrew toolchains and would install its own `rust` — plus `llvm`,
+`python`, and the rest of its runtime tail — so the formula looks for
+`~/.cargo/bin/cargo` first and declares the build dependency only when there
+isn't one. That is a deliberate break from how Homebrew prefers formulae to
+work: it means the build uses whatever rustup's default toolchain happens to
+be, so a broken or ancient one shows up here as a `brew install` failure.
 
 Or from a clone, without Homebrew:
 
