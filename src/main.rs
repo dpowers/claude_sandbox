@@ -30,6 +30,17 @@ const ENTRYPOINT: &str = include_str!("../entrypoint.sh");
 /// it is never built from until the host has accepted its current contents.
 const OVERLAY_DIR: &str = ".claude-sandbox";
 
+/// The same idea one level up: a directory in the state directory whose
+/// Dockerfile is layered onto every project, under the per-project overlay.
+/// It needs no acceptance step — it is not in any repository and is not
+/// reachable from any sandbox, so it is the host's own by construction.
+const GLOBAL_DIR: &str = "global";
+
+/// Launcher-owned record for the global overlay, kept alongside the
+/// per-project ones. `_` cannot start a project id (basenames are sanitized to
+/// `[a-z0-9-]`), so it can never collide with one.
+const GLOBAL_RECORD: &str = "_global";
+
 /// Ceiling on the overlay build context. Everything under it is read into
 /// memory to fingerprint it, and shipped to the builder on every rebuild, so a
 /// directory this large is a mistake worth naming rather than tolerating.
@@ -69,8 +80,8 @@ limits it was created with, so change them with `rm` first):
   -m, --memory <size>  memory ceiling, K/M/G/T/P suffix required (default: 8g)
   -c, --cpus <n>       vCPUs; the guest sees one more than this (default: 6)
       --rebuild        rebuild the image and recreate the VM
-      --no-overlay     ignore <dir>/.claude-sandbox/Dockerfile for this run
-      --accept-overlay accept the overlay's current contents without prompting
+      --no-overlay     ignore both overlays for this run (boot the plain base image)
+      --accept-overlay accept the project overlay's contents without prompting
 
 Overlay actions (for `claude-sandbox overlay`):
   (none)      show status, and a diff if the overlay is unaccepted
@@ -78,16 +89,22 @@ Overlay actions (for `claude-sandbox overlay`):
   --revert    restore the last accepted contents into the project
   --forget    drop the acceptance record and the stored snapshot
 
-Per-project image overlay:
-  If <dir>/.claude-sandbox/Dockerfile exists it is layered on top of the base
-  image, with that directory as the build context. Its instructions run as root
-  at build time, so nothing is built until you have seen the contents and
-  accepted them; the accepted bytes are recorded under ~/.config/claude-sandbox
-  and any later change re-prompts with a diff. The directory is mounted
-  read-only inside the VM, so writes to it from in there fail.
+Image overlays (base -> global -> project):
+  ~/.config/claude-sandbox/global/Dockerfile, if it exists, is layered onto
+  every project's image. It is yours and no sandbox can reach it, so it is
+  built as-is; edit it and the next launch rebuilds.
+
+  <dir>/.claude-sandbox/Dockerfile is then layered on top of that, with that
+  directory as the build context. It comes from the project's repository and
+  runs as root at build time, so nothing is built until you have seen the
+  contents and accepted them; the accepted bytes are recorded under
+  ~/.config/claude-sandbox and any later change re-prompts with a diff. The
+  directory is mounted read-only inside the VM, so writes to it from in there
+  fail.
 
 State:
   ~/.config/claude-sandbox/   dedicated ssh key, managed ssh config, overlay records
+  ~/.config/claude-sandbox/global/  Dockerfile layered onto every project
   ~/.claude-sandbox/          mounted as ~/.claude in every VM (Claude login)
 
 A VM deletes itself ~15 seconds after its last ssh session ends (Zed window
@@ -275,6 +292,8 @@ struct Sandbox {
     target: String,
     /// `<project>/.claude-sandbox` on the host — where the overlay is authored.
     overlay_src: PathBuf,
+    /// The global overlay's build context, shared by every project.
+    global_src: PathBuf,
     /// Host-side record for that overlay: the accepted snapshot, its
     /// fingerprint, and the context the image is actually built from.
     overlay_state: PathBuf,
@@ -682,6 +701,7 @@ impl Sandbox {
         let proj_id = format!("{base}-{}", &hash[..6]);
         let overlay_state = state_dir.join("overlays").join(&proj_id);
         let overlay_src = abs.join(OVERLAY_DIR);
+        let global_src = state_dir.join(GLOBAL_DIR);
 
         Ok(Sandbox {
             key: state_dir.join("id_ed25519"),
@@ -698,6 +718,7 @@ impl Sandbox {
             proj_id,
             overlay_src,
             overlay_state,
+            global_src,
             user,
             home,
             state_dir,
@@ -772,6 +793,7 @@ impl Sandbox {
         // Ask about the overlay before building anything: the answer decides
         // which image is wanted, and "skip" should not arrive after a build.
         let overlay = self.resolve_overlay(opts)?;
+        let global = self.resolve_global(opts)?;
 
         if opts.rebuild || !self.have_image(&self.base_image)? {
             self.build_image()?;
@@ -782,10 +804,14 @@ impl Sandbox {
                 println!("recreating {} with the new image", self.name);
             }
         }
-        let image = match &overlay {
-            Some(fp) => self.ensure_overlay_image(fp)?,
-            None => self.base_image.clone(),
-        };
+        // base -> global -> project, each layer built on whatever is beneath it.
+        let mut image = self.base_image.clone();
+        if let Some(fp) = &global {
+            image = self.ensure_global_image(fp)?;
+        }
+        if let Some(fp) = &overlay {
+            image = self.ensure_overlay_image(fp, &image)?;
+        }
 
         self.ensure_container(&image)?;
         // Connect by IP, not by name: the runtime's DNS record appears some
@@ -1182,87 +1208,166 @@ impl Sandbox {
         }
     }
 
-    /// Build (or reuse) the image for an accepted overlay.
+    /// Is the global overlay in play this run, and what are its contents?
     ///
-    /// The tag carries a fingerprint of the accepted contents and of the base
-    /// image's build stamp, so "is this image current?" is answered by whether
-    /// the tag exists: editing the overlay and editing it back costs nothing,
-    /// and a base rebuild invalidates it. No bookkeeping to go stale, and it
-    /// heals itself if images are pruned by hand.
-    fn ensure_overlay_image(&self, content_fp: &str) -> Result<String> {
+    /// No acceptance step: unlike a project overlay this is not something a
+    /// repository brought with it, and no sandbox can reach it — so there is
+    /// nobody to gate against, and a prompt here would only train the reflex
+    /// that answers the one that matters without reading.
+    fn resolve_global(&self, opts: &Opts) -> Result<Option<String>> {
+        if !self.global_src.is_dir() {
+            return Ok(None);
+        }
+        if opts.no_overlay {
+            println!("--no-overlay: ignoring {}", self.global_src.display());
+            return Ok(None);
+        }
+        // The claim above — that no sandbox can reach it — holds because the
+        // state directory is not one of the two mounts. Sandboxing a directory
+        // that contains it (`~`, a dotfiles repo) breaks that, and a global
+        // overlay the guest can rewrite is exactly what the per-project gate
+        // exists to prevent. Note that this is not the worst of it: that mount
+        // also hands the guest the ssh key every other sandbox is reached with.
+        let state = fs::canonicalize(&self.state_dir).unwrap_or_else(|_| self.state_dir.clone());
+        if state.starts_with(&self.abs) {
+            eprintln!(
+                "claude-sandbox: warning: {} is inside the project being mounted, so the \
+                 VM could rewrite it.\n  Skipping the global overlay for this project.{}",
+                state.display(),
+                if self.key.starts_with(&self.abs) {
+                    "\n  warning: this mount also exposes the ssh key in that directory \
+                     to the guest, which is the key every other sandbox is reached with."
+                } else {
+                    ""
+                }
+            );
+            return Ok(None);
+        }
+        let entries = scan_context(&self.global_src)?;
+        if !entries.iter().any(|e| e.path == "Dockerfile") {
+            println!(
+                "note: {} has no Dockerfile, so no global overlay is applied",
+                self.global_src.display()
+            );
+            return Ok(None);
+        }
+        Ok(Some(fingerprint(&entries)))
+    }
+
+    fn ensure_global_image(&self, fp: &str) -> Result<String> {
+        self.ensure_layer(
+            &format!("glb-{}", self.user),
+            &self.state_dir.join("overlays").join(GLOBAL_RECORD),
+            &self.global_src,
+            fp,
+            &self.global_src,
+            &self.base_image,
+        )
+    }
+
+    /// The project layer is built from the accepted snapshot rather than from
+    /// the project, so the bytes handed to the builder are exactly the ones
+    /// that were shown and accepted, with no window in between to change them.
+    fn ensure_overlay_image(&self, fp: &str, parent: &str) -> Result<String> {
+        self.ensure_layer(
+            &format!("ovl-{}", self.proj_id),
+            &self.overlay_state,
+            &self.overlay_snapshot(),
+            fp,
+            &self.overlay_src,
+            parent,
+        )
+    }
+
+    /// Build (or reuse) one image layer on top of `parent`.
+    ///
+    /// The tag carries a fingerprint of the layer's contents, of the image it
+    /// sits on, and of the base image's build stamp — so "is this image
+    /// current?" is answered by whether the tag exists. Editing a layer and
+    /// editing it back costs nothing; changing one invalidates everything
+    /// stacked above it. No bookkeeping to go stale, and it heals itself if
+    /// images are pruned by hand.
+    ///
+    /// `context` is the directory built; `source` is the path to name in
+    /// messages, which differs when the two are not the same (the project
+    /// layer builds a snapshot of a directory the user authors elsewhere).
+    fn ensure_layer(
+        &self,
+        stem: &str,
+        record: &Path,
+        context: &Path,
+        fp: &str,
+        source: &Path,
+        parent: &str,
+    ) -> Result<String> {
         let mut h = Sha256::new();
-        h.update(content_fp.as_bytes());
+        h.update(fp.as_bytes());
         h.update([0]);
-        h.update(self.base_image.as_bytes());
+        h.update(parent.as_bytes());
         h.update([0]);
         h.update(self.base_stamp()?.as_bytes());
-        let tag = format!("{IMAGE_REPO}:ovl-{}-{}", self.proj_id, &format!("{:x}", h.finalize())[..8]);
+        let tag = format!("{IMAGE_REPO}:{stem}-{}", &format!("{:x}", h.finalize())[..8]);
         if self.have_image(&tag)? {
             return Ok(tag);
         }
 
-        let snap = self.overlay_snapshot();
-        let fragment = fs::read_to_string(snap.join("Dockerfile"))
-            .with_context(|| format!("reading {}", snap.join("Dockerfile").display()))?;
+        let fragment = fs::read_to_string(context.join("Dockerfile"))
+            .with_context(|| format!("reading {}", context.join("Dockerfile").display()))?;
         let body = check_fragment(&fragment)?;
 
-        // Built from the accepted snapshot rather than from the project, so
-        // the bytes handed to the builder are exactly the ones that were shown
-        // and accepted, with no window in between for them to change.
-        let build = self.overlay_state.join("build");
+        let build = record.join("build");
         if build.exists() {
             fs::remove_dir_all(&build)?;
         }
-        copy_context(&snap, &build)?;
-        // Overwrites the copy of the project's own Dockerfile: the build reads
-        // the generated one, and the original stays intact in `accepted/`.
-        fs::write(build.join("Dockerfile"), self.generated_dockerfile(&body))?;
+        copy_context(context, &build)?;
+        // Overwrites the copy of the authored Dockerfile: the build reads the
+        // generated one, and the original stays where it was written.
+        fs::write(build.join("Dockerfile"), self.generated_dockerfile(&body, source, parent))?;
 
-        println!("building {tag} from {} ...", self.overlay_src.display());
+        println!("building {tag} from {} ...", source.display());
         passthrough(
             "container",
             &["build", "-t", &tag,
               "--build-arg", &format!("USERNAME={}", self.user),
               &build.to_string_lossy()],
         )
-        .with_context(|| format!("building the image overlay from {}", self.overlay_src.display()))?;
-        self.prune_overlay_images(&tag);
+        .with_context(|| format!("building the image layer from {}", source.display()))?;
+        self.prune_layer_images(record, &tag);
         Ok(tag)
     }
 
-    /// The Dockerfile actually built: the project's fragment with a `FROM` in
+    /// The Dockerfile actually built: the authored fragment with a `FROM` in
     /// front of it and the directives that must survive it behind.
-    fn generated_dockerfile(&self, body: &str) -> String {
+    fn generated_dockerfile(&self, body: &str, source: &Path, parent: &str) -> String {
         format!(
             "# Generated by claude-sandbox from {src}/Dockerfile.\n\
              # Edit that file, not this one — this copy is rewritten every build.\n\
-             FROM {base}\n\
+             FROM {parent}\n\
              # ARG does not survive FROM, so it is re-declared for the fragment.\n\
              ARG USERNAME={user}\n\
              USER root\n\
-             # ---- begin project overlay ----\n\
+             # ---- begin overlay ----\n\
              {body}\
-             # ---- end project overlay ----\n\
+             # ---- end overlay ----\n\
              # Re-asserted after the fragment (last one wins) so a stray directive in it\n\
              # cannot leave the VM without the entrypoint that installs the egress\n\
              # firewall. This is a guard against accident, not against a hostile overlay:\n\
-             # the fragment runs as root and can rewrite anything the base image set up,\n\
-             # which is why it is not built until the host has accepted it.\n\
+             # the fragment runs as root and can rewrite anything beneath it, which is why\n\
+             # a project's is not built until the host has accepted it.\n\
              USER root\n\
              EXPOSE 22\n\
              ENTRYPOINT [\"/usr/local/bin/entrypoint.sh\"]\n",
-            src = self.overlay_src.display(),
-            base = self.base_image,
+            src = source.display(),
             user = self.user,
         )
     }
 
-    /// Drop the tag the previous overlay build produced. Overlay tags are
+    /// Drop the tag this layer's previous build produced. Layer tags are
     /// content-addressed, so an old one is never reused and they would
     /// otherwise accumulate one per edit; only the layers unique to them are
-    /// freed, since the base underneath is shared.
-    fn prune_overlay_images(&self, keep: &str) {
-        let marker = self.overlay_state.join("built.tag");
+    /// freed, since everything underneath is shared.
+    fn prune_layer_images(&self, record: &Path, keep: &str) {
+        let marker = record.join("built.tag");
         if let Ok(prev) = fs::read_to_string(&marker) {
             let prev = prev.trim();
             // Two spellings because the runtime's is the one that matters and
@@ -1303,10 +1408,21 @@ impl Sandbox {
     }
 
     fn overlay_status(&self) -> Result<()> {
+        // The whole stack, so it is clear from one command what a VM for this
+        // project is actually built from.
+        println!(
+            "global:   {}{}",
+            self.global_src.display(),
+            if self.global_src.is_dir() {
+                "  (applied to every project)"
+            } else {
+                "  (none — create it to extend every project's image)"
+            }
+        );
         println!("overlay:  {}", self.overlay_src.display());
         println!("record:   {}", self.overlay_state.display());
         if !self.overlay_src.is_dir() {
-            println!("status:   absent — this project boots the base image unchanged");
+            println!("status:   absent — this project adds nothing of its own");
             return Ok(());
         }
         let current = scan_context(&self.overlay_src)?;

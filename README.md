@@ -32,9 +32,9 @@ throwaway Linux VM where:
 
 Your Claude Code login is shared across VMs (via `~/.claude-sandbox`), so you
 authenticate once rather than per project. A project that needs more than the
-base image can carry its own Dockerfile — see [Per-project image
-overlay](#per-project-image-overlay), which is gated behind an explicit
-acceptance step for the same reasons as everything above.
+base image can carry its own Dockerfile, and you can layer one onto every
+project at once — see [Image overlays](#image-overlays). A project's is gated
+behind an explicit acceptance step, for the same reasons as everything above.
 
 ## Requirements
 
@@ -153,7 +153,7 @@ this the first time it opens Zed and then keeps quiet; delete
 | `claude-sandbox shell <dir> [cmd…]` | Same, but `ssh` in instead of opening Zed |
 | `claude-sandbox stop <dir>` | Stop the project's VM (it deletes itself on stop) |
 | `claude-sandbox rm <dir>` | Stop and delete the VM, and drop its ssh-config block |
-| `claude-sandbox overlay [action] <dir>` | Inspect or manage the project's [image overlay](#per-project-image-overlay) |
+| `claude-sandbox overlay [action] <dir>` | Inspect or manage the project's [image overlay](#image-overlays) |
 | `claude-sandbox --rebuild <dir>` | Rebuild the image, recreate the VM, open Zed |
 
 ### Options
@@ -165,9 +165,9 @@ after it as well. Both `-m 12g` and `--memory=12g` forms work.
 | --- | --- |
 | `-m`, `--memory <size>` | Memory ceiling for the VM, default `8g`. A `K`/`M`/`G`/`T`/`P` suffix is required — the runtime reads a bare number as mebibytes, so `--memory 8` would mean 8 MiB |
 | `-c`, `--cpus <n>` | vCPUs for the VM, default `6`. The runtime adds one vCPU of overhead, so the guest kernel reports `n + 1` |
-| `--rebuild` | Rebuild the image and recreate the VM |
-| `--no-overlay` | Ignore the project's [image overlay](#per-project-image-overlay) for this run and boot the base image |
-| `--accept-overlay` | Accept the overlay's current contents without prompting — for scripts, where there is no one to ask |
+| `--rebuild` | Rebuild the base image, and with it every overlay, then recreate the VM |
+| `--no-overlay` | Ignore both [image overlays](#image-overlays) for this run and boot the plain base image |
+| `--accept-overlay` | Accept the project overlay's current contents without prompting — for scripts, where there is no one to ask |
 
 `-m`/`-c` are read **when the VM is created**. A running VM keeps the limits it
 was created with, so passing different ones prints a note telling you to
@@ -199,20 +199,64 @@ its first connection. Reopening a project recreates it in a couple of seconds �
 these VMs are meant to be disposable, and all durable state lives in the two
 mounts.
 
-## Per-project image overlay
+## Image overlays
 
 The base image is deliberately thin — Ubuntu, Node, git, the Claude Code CLI,
 and a C/C++ toolchain (`build-essential` + `pkg-config`) for the native builds
-most language ecosystems fall back to. When a project needs more than that, put
-a Dockerfile in the project itself:
+most language ecosystems fall back to. Two layers can extend it, and a VM's
+image is whichever of them exist, stacked:
+
+```
+claude-sandbox:<user>                     base
+  └─ ~/.config/claude-sandbox/global/     yours, applied to every project
+       └─ <project>/.claude-sandbox/      the project's own
+```
+
+### The global overlay
+
+Most people want the same handful of tools in every sandbox. Put them in a
+Dockerfile in your own config directory, and every project picks them up:
+
+```dockerfile
+# ~/.config/claude-sandbox/global/Dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ripgrep fd-find jq \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+The rules are the same as for a project overlay below — no `FROM` line,
+`$USERNAME` available, and the directory is the build context, so a `COPY`
+reads files sitting next to the Dockerfile. Edit it and the next launch of any
+project rebuilds. It gets a directory of its own rather than a bare
+`~/.config/claude-sandbox/Dockerfile` because a build context is a whole
+directory, and using the state directory itself would ship your SSH private key
+to the builder.
+
+**No acceptance step, unlike a project overlay.** This file is not in any
+repository, and no sandbox can reach it: a VM mounts only the project directory
+and `~/.claude-sandbox`, never the state directory. There is nobody to gate
+against, and prompting you to approve a file you just edited yourself would
+only train the reflex that dismisses the prompt that does matter.
+
+The exception is sandboxing a directory that *contains* the state directory —
+your home directory, or a dotfiles repo. The guest can rewrite the global
+overlay then, so the launcher says so and skips it. Be aware that in that
+situation the mount also hands the guest `~/.config/claude-sandbox/id_ed25519`,
+which is the key every other sandbox is reached with; the launcher warns about
+that too, but it does not currently refuse the mount.
+
+### The per-project overlay
+
+When one project needs more than your standard set, put a Dockerfile in the
+project itself:
 
 ```
 <project>/.claude-sandbox/Dockerfile
 ```
 
-It is layered **on top of** the base image, so it starts where the base leaves
-off. Write only the extra layers — there is **no `FROM` line**, because the
-launcher supplies it:
+It is layered **on top of** the global overlay (or the base image, if you have
+no global one), so it starts where that leaves off. Write only the extra
+layers — there is **no `FROM` line**, because the launcher supplies it:
 
 ```dockerfile
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -234,7 +278,7 @@ team shares one sandbox definition. If you would rather have a file your editor
 and `hadolint` will parse standalone, write `FROM claude-sandbox-base` as the
 first line; the launcher recognizes that placeholder and replaces it. Any other
 `FROM` is rejected — it would start a fresh build stage and silently discard
-the base image, leaving a VM with no `sshd`, no firewall, and no Claude Code.
+the layer beneath, leaving a VM with no `sshd`, no firewall, and no Claude Code.
 
 ### Accepting an overlay
 
@@ -300,10 +344,14 @@ there: the files are visible and readable, so nothing looks deleted.)
 
 | Command | What it does |
 | --- | --- |
-| `claude-sandbox overlay <dir>` | Status: accepted, changed (with a diff), or never accepted |
+| `claude-sandbox overlay <dir>` | Status of both layers: where the global one is, and whether the project's is accepted, changed (with a diff), or never accepted |
 | `claude-sandbox overlay --accept <dir>` | Accept the current contents without launching a VM |
 | `claude-sandbox overlay --revert <dir>` | Restore the last accepted contents into the project |
 | `claude-sandbox overlay --forget <dir>` | Drop the acceptance record and snapshot |
+
+The actions apply to the *project's* overlay. The global one needs no
+management commands — it is a file in your config directory with no gate on it,
+so you create, edit, and delete it with your editor.
 
 These are pure host-side file operations — they need neither the `container`
 runtime nor a running VM. `claude-sandbox rm` deliberately leaves the record
@@ -313,12 +361,18 @@ it works after the project directory itself is gone.
 
 ### Rebuilds
 
-Overlay images are tagged with a fingerprint of the accepted contents and of
-the base image, so "is this image current?" is answered by whether that tag
-exists. Editing the overlay and editing it back costs nothing; rebuilding the
-base invalidates every project's overlay. If a VM is running on an image that
-is no longer current, the launcher says so and recreates it — a couple of
-seconds, and all durable state is in the mounts.
+Each layer's image is tagged with a fingerprint of its own contents, of the
+image it sits on, and of the base image's build stamp — so "is this image
+current?" is answered by whether that tag exists. Editing a layer and editing
+it back costs nothing, and changing one invalidates everything stacked above
+it: edit the global overlay and every project's rebuilds; rebuild the base and
+both do. If a VM is running on an image that is no longer current, the launcher
+says so and recreates it — a couple of seconds, and all durable state is in the
+mounts.
+
+Superseded tags are deleted as each layer is rebuilt, so they don't accumulate
+one per edit. Only the layers unique to them are freed; everything underneath
+is shared.
 
 ### What an overlay can and cannot do
 
@@ -332,7 +386,8 @@ one. That is the whole reason the acceptance prompt exists: an overlay is code
 you are choosing to run, and the launcher makes sure it is a choice.
 
 If you would rather not deal with any of this for a particular project, pass
-`--no-overlay` and it boots the base image. The read-only mount still applies.
+`--no-overlay` and it boots the plain base image, skipping the global overlay
+too. The read-only mount still applies.
 
 ## Architecture
 
@@ -362,19 +417,21 @@ consumes.
    from container names doubling as DNS labels.
 3. **Key** — generate a dedicated ed25519 key in `~/.config/claude-sandbox` on
    first use.
-4. **Overlay** — if the project has a `.claude-sandbox/` directory, read it and
+4. **Overlays** — if the project has a `.claude-sandbox/` directory, read it and
    compare it against the accepted snapshot, prompting if it is new or changed
-   (see [Per-project image overlay](#per-project-image-overlay)). Asked before
-   anything is built, so "skip" never arrives after a five-minute build.
+   (see [Image overlays](#image-overlays)). Asked before anything is built, so
+   "skip" never arrives after a five-minute build. The global overlay is read
+   here too, without a prompt.
 5. **Image** — build `claude-sandbox:<user>` if absent. The account name is
    baked into the image, so it goes in the tag: changing `CLAUDE_SANDBOX_USER`
    builds a second image rather than booting one whose only account you can't
    log in as. Authorized keys are the dedicated key plus any `~/.ssh/id_*.pub`,
    joined with a literal `\n` escape that the Dockerfile expands with
    `printf '%b'` (a raw newline in a `--build-arg` value crashes Apple's
-   builder). An accepted overlay is then built on top as
-   `claude-sandbox:ovl-<project>-<fingerprint>`, from the snapshot rather than
-   from the project directory.
+   builder). The global overlay is then built on top as
+   `claude-sandbox:glb-<user>-<fingerprint>`, and an accepted project overlay on
+   top of *that* as `claude-sandbox:ovl-<project>-<fingerprint>` — the latter
+   from the snapshot rather than from the project directory.
 6. **Container** — reuse only a *running* container, and only if it was created
    from the image this run wants; anything else is torn down and recreated.
    Created with `--rm`, `--cap-add CAP_NET_ADMIN`, and two bind mounts: the
@@ -447,7 +504,9 @@ grace period down to the short idle timeout.
 | `~/.config/claude-sandbox/id_ed25519{,.pub}` | Dedicated SSH key for VM access |
 | `~/.config/claude-sandbox/ssh_config` | Managed host blocks, `Include`d from `~/.ssh/config` |
 | `~/.config/claude-sandbox/zed-trust-notice` | Marker that the Restricted Mode note has been printed |
+| `~/.config/claude-sandbox/global/` | Your global overlay: a `Dockerfile` and anything it `COPY`s, layered onto every project |
 | `~/.config/claude-sandbox/overlays/<project>/` | Accepted overlay: `accepted.json` (fingerprint), `accepted/` (snapshot), `build/` (generated context), `built.tag` |
+| `~/.config/claude-sandbox/overlays/_global/` | The same launcher-owned bits for the global overlay (`build/`, `built.tag`) — no snapshot, since it is not gated |
 | `~/.config/claude-sandbox/containers/<name>.image` | Which image a running VM was created from, for the staleness check |
 | `~/.config/claude-sandbox/base-<user>.stamp` | Bumped on every base-image rebuild, so overlays rebuild on top of it |
 | `~/.claude-sandbox/` | Mounted as `~/.claude` in every VM — the persistent Claude Code login and settings |
