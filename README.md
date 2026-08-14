@@ -22,6 +22,9 @@ throwaway Linux VM where:
   link-local, CGNAT, and multicast space are rejected by an `nftables` rule
   applied at boot, so nothing in the VM can reach your router, NAS, printers,
   or other machines;
+- **nothing in the VM can become root** — the account you ssh in as has no
+  `sudo`, which is what keeps the rule above from being one command away from
+  deletion. [`--sudo`](#root-inside-the-vm) opts back in when you need it;
 - **the Internet still works** — public destinations are allowed, plus DNS to
   the configured resolvers (which usually *are* on the LAN), so `npm install`,
   `git push`, and the Claude API all work normally;
@@ -181,24 +184,29 @@ this the first time it opens Zed and then keeps quiet; delete
 | `claude-sandbox stop <dir>` | Stop the project's VM (it deletes itself on stop) |
 | `claude-sandbox rm <dir>` | Stop and delete the VM, and drop its ssh-config block |
 | `claude-sandbox overlay [action] <dir>` | Inspect or manage the project's [image overlay](#image-overlays) |
-| `claude-sandbox --rebuild <dir>` | Rebuild the image, recreate the VM, open Zed |
+| `claude-sandbox rebuild [opts] <dir>` | Rebuild every layer from scratch — no build cache, and the OS image is re-pulled — then stop. Builds images and nothing else: no VM is created and no editor is opened. See [Keeping images up to date](#keeping-images-up-to-date) |
 
 ### Options
 
-Accepted before the directory, and (except with `stop`/`rm`, which reject them)
-after it as well. Both `-m 12g` and `--memory=12g` forms work.
+Accepted before the directory, and (except with `stop`/`rm`/`overlay`, which
+reject them) after it as well. Both `-m 12g` and `--memory=12g` forms work.
 
 | Option | Effect |
 | --- | --- |
 | `-m`, `--memory <size>` | Memory ceiling for the VM, default `8g`. A `K`/`M`/`G`/`T`/`P` suffix is required — the runtime reads a bare number as mebibytes, so `--memory 8` would mean 8 MiB |
 | `-c`, `--cpus <n>` | vCPUs for the VM, default `6`. The runtime adds one vCPU of overhead, so the guest kernel reports `n + 1` |
-| `--rebuild` | Rebuild the base image, and with it every overlay, then recreate the VM |
+| `--sudo` | Give the VM's account passwordless root — see [Root inside the VM](#root-inside-the-vm) |
+| `--use-cache` | Only in the `rebuild` mode: let the builder answer from cache, so the rebuild picks up Dockerfile edits and nothing else. Seconds instead of minutes |
 | `--no-overlay` | Ignore both [image overlays](#image-overlays) for this run and boot the plain base image |
 | `--accept-overlay` | Accept the project overlay's current contents without prompting — for scripts, where there is no one to ask |
+| `-h`, `--help` | Usage for the launcher, or for one mode with `claude-sandbox <mode> --help` |
+| `-V`, `--version` | Print the launcher's version |
 
 `-m`/`-c` are read **when the VM is created**. A running VM keeps the limits it
 was created with, so passing different ones prints a note telling you to
-`claude-sandbox rm <dir>` first rather than silently doing nothing.
+`claude-sandbox rm <dir>` first rather than silently doing nothing. The modes
+that never create a VM — `stop`, `rm`, `overlay`, `rebuild` — reject them
+outright instead of accepting them and doing nothing.
 
 The defaults are deliberately not the host's full core count and RAM. There is
 one VM per project, so the ceilings multiply across everything you have open;
@@ -216,7 +224,62 @@ step can outgrow the rest of that gigabyte.
 | `CLAUDE_SANDBOX_DEBUG` | Keep failed VMs around (skips `--rm`) so `container logs <name>` works |
 | `CLAUDE_SANDBOX_USER` | Account name inside the VM (default: your host username) |
 | `CLAUDE_SANDBOX_STATE` | Override the state directory (default `~/.config/claude-sandbox`) |
+| `CLAUDE_SANDBOX_RESEED` | Overwrite the sandbox's Claude credentials from the host keychain. Normally the host's copy is only written when it outlives the sandbox's, since replacing a fresher token with a staler one can invalidate the newer session |
 | `CLAUDE_SANDBOX_ACCEPT_OVERLAY` | Accept overlay contents without prompting, same as `--accept-overlay` |
+| `CLAUDE_SANDBOX_SUDO` | Passwordless root in every VM, same as `--sudo`. Unlike the others, the value is read: `0`, `false`, `no`, `off` and empty mean off |
+
+### Claude Code config in the VM
+
+Claude Code inside the VM is seeded from the host on every run: OAuth tokens
+exported from the login Keychain, plus `settings.json`, `CLAUDE.md`, and your
+`agents`, `commands`, `skills`, `output-styles` and `plugins`.
+
+It is a one-way copy into `~/.claude-sandbox`, which is what gets mounted as
+`~/.claude` in the guest — never a mount of `~/.claude` itself. So transcripts
+stay on the host, and nothing the VM writes can reach config the host later
+executes. Credentials are the one exception to "every run": the host's copy is
+only written when it outlives the sandbox's, since overwriting a fresher token
+with a staler one can invalidate the newer session. `CLAUDE_SANDBOX_RESEED=1`
+forces it.
+
+### Root inside the VM
+
+By default the account you ssh in as is not in the `sudo` group and has no
+sudoers entry, so nothing inside the VM can become root. Root login over SSH is
+off and root's own password is locked, so there is no other way in either.
+
+That default is what the egress firewall rests on. The `nftables` rules are
+enforced by the guest's own kernel and the guest holds `CAP_NET_ADMIN`, so root
+in there could delete the whole table with the same one-line command the
+entrypoint uses to replace it. The same goes for the read-only
+`.claude-sandbox/` mount, which root can simply remount `rw`. Without the sudo
+default, both are guardrails against accident rather than barriers against a
+prompt-injected or otherwise adversarial agent.
+
+The cost is that anything writing outside your home directory fails:
+`apt-get install`, `npm install -g`, `mount`, binding a port below 1024. The
+intended home for those is an [image overlay](#image-overlays), which runs as
+root at build time on the host.
+
+`--sudo` (or `CLAUDE_SANDBOX_SUDO=1`) restores the previous behaviour —
+`NOPASSWD:ALL` for the account:
+
+```
+claude-sandbox --sudo ~/Projects/my-app
+```
+
+Nothing enforced *inside* the VM survives that. What still holds is everything
+enforced outside it: the VM boundary itself, the fact that the only host paths
+mounted are the project directory and `~/.claude-sandbox`, and the
+[acceptance gate](#accepting-an-overlay) that keeps the host from building
+image contents a human has not read.
+
+The two variants are separate images (`claude-sandbox:<user>` and
+`claude-sandbox:<user>-sudo`). Adding or dropping the flag therefore builds a
+new one and recreates the VM — cheap, because they diverge only in the last few
+small layers and share the whole toolchain beneath. The launcher prints a line
+on every launch where `--sudo` is in effect, since it can arrive from the
+environment rather than from the command you typed.
 
 ### Lifecycle
 
@@ -234,10 +297,15 @@ most language ecosystems fall back to. Two layers can extend it, and a VM's
 image is whichever of them exist, stacked:
 
 ```
-claude-sandbox:<user>                     base
+claude-sandbox:<user>                     base (…-sudo under --sudo)
   └─ ~/.config/claude-sandbox/global/     yours, applied to every project
        └─ <project>/.claude-sandbox/      the project's own
 ```
+
+These are also where system packages belong now that [nothing in the VM runs as
+root](#root-inside-the-vm): an overlay's `RUN` executes as root on the host's
+builder, so `apt-get install` works there even though it does not inside the
+running VM.
 
 ### The global overlay
 
@@ -353,12 +421,13 @@ unreviewed there.
 inside the VM fail with `EROFS`. Ordinary agent behavior — editing a file,
 running a formatter, an errant `rm` — bounces off it.
 
-**This is not a wall.** The sandbox account has passwordless sudo and can
-`mount -o remount,rw` its way past. What the mount buys is that touching the
-file at all takes a deliberate, conspicuous act rather than an ordinary write.
-The control that actually holds is the acceptance prompt above: whatever
-happens in the VM, nothing gets built on the host without a human reading a
-diff first.
+**How much of a wall this is depends on the guest.** By default the sandbox
+account cannot become root, so `mount -o remount,rw` is not available to it at
+all. Under [`--sudo`](#root-inside-the-vm) it is one command away, and what the
+mount buys there is only that touching the file takes a deliberate, conspicuous
+act rather than an ordinary write. Either way the control that actually holds
+is the acceptance prompt above: whatever happens in the VM, nothing gets built
+on the host without a human reading a diff first.
 
 One consequence worth knowing: **a `git checkout`, `pull`, `stash`, or `rebase`
 inside the VM that would change `.claude-sandbox/` fails.** Git only writes
@@ -401,12 +470,55 @@ Superseded tags are deleted as each layer is rebuilt, so they don't accumulate
 one per edit. Only the layers unique to them are freed; everything underneath
 is shared.
 
+That machinery answers "have these instructions changed?", which is a different
+question from "have their *results* changed" — see [Keeping images up to
+date](#keeping-images-up-to-date).
+
+### Keeping images up to date
+
+Every version an image installs is pinned the moment its layer is built.
+`RUN npm install -g @anthropic-ai/claude-code` resolves `latest` exactly once;
+`apt-get install ripgrep` in your global overlay resolves it once. After that
+the builder answers both from its layer cache, and it will keep doing so for as
+long as the instructions above them don't change — which, for a Dockerfile
+nobody is editing, is forever. Nothing about this is specific to Claude Code;
+it is true of every package any layer pulls in.
+
+The `rebuild` mode is the way out. It re-pulls the OS image named in the base
+`FROM`, then re-runs every step of every layer with the cache discarded, so
+what lands in the image is what upstream is publishing today:
+
+```sh
+claude-sandbox rebuild ~/Projects/my-app
+```
+
+That takes a few minutes — apt, Node, the CLI, and anything your overlays add,
+all fetched again. It is the right hammer when the question is "why am I still
+on last month's CLI", and the wrong one for everything else.
+
+It builds images and stops: no VM is created, nothing is seeded, no editor
+opens. The one thing it does beyond building is delete the project's VM if one
+is running, because the base image keeps its tag across a rebuild — the
+image-change check that normally retires a stale VM cannot see it, so a running
+VM would go on serving exactly the layers you just replaced. The next launch
+recreates it in seconds.
+
+For everything else there is `rebuild --use-cache`, which re-runs the build
+but lets the builder answer from cache. Edits to a Dockerfile invalidate their
+own layer and everything below it, so the edit lands; nothing else moves. That
+is the fast path after changing an overlay.
+
+A failed pull is a warning rather than an error — offline, or a registry having
+a bad day, gets you a build on the OS image already on disk rather than no
+build at all.
+
 ### What an overlay can and cannot do
 
 An overlay runs as root while building the image, so it **can** undo anything
 the base image set up — replace the entrypoint and lose the egress firewall,
-add an authorized key, anything. The launcher re-asserts `USER`, `EXPOSE`, and
-`ENTRYPOINT` after your fragment so that a stray directive cannot strand a VM
+add an authorized key, write its own sudoers entry and hand the VM back the
+root the default withholds, anything. The launcher re-asserts `USER`, `EXPOSE`,
+and `ENTRYPOINT` after your fragment so that a stray directive cannot strand a VM
 without its firewall by accident, but that is a guard against mistakes, not
 against a hostile overlay, and no amount of generated boilerplate could make it
 one. That is the whole reason the acceptance prompt exists: an overlay is code
@@ -423,7 +535,7 @@ Three files, one binary:
 | File | Role |
 | --- | --- |
 | `src/main.rs` | The `claude-sandbox` launcher: name derivation, image build, container lifecycle, readiness polling, ssh-config management |
-| `Dockerfile` | The guest image: Ubuntu 24.04 + Node 22 + Claude Code CLI + `build-essential` + `sshd`, key-only login, passwordless sudo |
+| `Dockerfile` | The guest image: Ubuntu 24.04 + Node 22 + Claude Code CLI + `build-essential` + `sshd`, key-only login, and no route to root unless built with `SUDO=1` |
 | `entrypoint.sh` | Runs in the guest at boot: applies the egress firewall, makes `.claude-sandbox/` read-only, starts the idle watchdog, execs `sshd` |
 
 `Dockerfile` and `entrypoint.sh` are embedded into the binary with
@@ -449,16 +561,22 @@ consumes.
    (see [Image overlays](#image-overlays)). Asked before anything is built, so
    "skip" never arrives after a five-minute build. The global overlay is read
    here too, without a prompt.
-5. **Image** — build `claude-sandbox:<user>` if absent. The account name is
-   baked into the image, so it goes in the tag: changing `CLAUDE_SANDBOX_USER`
-   builds a second image rather than booting one whose only account you can't
-   log in as. Authorized keys are the dedicated key plus any `~/.ssh/id_*.pub`,
+5. **Image** — build `claude-sandbox:<user>` if absent (`…-sudo` under
+   `--sudo`). The account name is baked into the image, so it goes in the tag:
+   changing `CLAUDE_SANDBOX_USER` builds a second image rather than booting one
+   whose only account you can't log in as. So is whether that account can
+   become root, for the same reason — reusing one variant for the other would
+   silently either break every `apt-get` or hand back the root the default
+   withholds. Authorized keys are the dedicated key plus any `~/.ssh/id_*.pub`,
    joined with a literal `\n` escape that the Dockerfile expands with
    `printf '%b'` (a raw newline in a `--build-arg` value crashes Apple's
    builder). The global overlay is then built on top as
    `claude-sandbox:glb-<user>-<fingerprint>`, and an accepted project overlay on
    top of *that* as `claude-sandbox:ovl-<project>-<fingerprint>` — the latter
-   from the snapshot rather than from the project directory.
+   from the snapshot rather than from the project directory. Under `rebuild`,
+   the reference in the base `FROM` is re-pulled first (parsed out of the
+   embedded Dockerfile, so it can't drift), and every one of these builds gets
+   `--no-cache` unless `--use-cache` says otherwise.
 6. **Container** — reuse only a *running* container, and only if it was created
    from the image this run wants; anything else is torn down and recreated.
    Created with `--rm`, `--cap-add CAP_NET_ADMIN`, and two bind mounts: the
@@ -515,6 +633,11 @@ directly, so no DHCP client runs.
 Resolver addresses are sanitized before they reach `nft`, so a malformed
 `/etc/resolv.conf` can neither inject syntax nor abort the fail-closed boot.
 
+The table is enforced by the guest's own kernel, so it holds exactly as long as
+nothing in the guest can become root — see [Root inside the
+VM](#root-inside-the-vm) for why the account has no `sudo` by default, and what
+`--sudo` gives up.
+
 ### The idle watchdog
 
 A background loop samples `/proc/net/tcp{,6}` every 5s for established
@@ -532,10 +655,10 @@ grace period down to the short idle timeout.
 | `~/.config/claude-sandbox/ssh_config` | Managed host blocks, `Include`d from `~/.ssh/config` |
 | `~/.config/claude-sandbox/zed-trust-notice` | Marker that the Restricted Mode note has been printed |
 | `~/.config/claude-sandbox/global/` | Your global overlay: a `Dockerfile` and anything it `COPY`s, layered onto every project |
-| `~/.config/claude-sandbox/overlays/<project>/` | Accepted overlay: `accepted.json` (fingerprint), `accepted/` (snapshot), `build/` (generated context), `built.tag` |
-| `~/.config/claude-sandbox/overlays/_global/` | The same launcher-owned bits for the global overlay (`build/`, `built.tag`) — no snapshot, since it is not gated |
+| `~/.config/claude-sandbox/overlays/<project>/` | Accepted overlay: `accepted.json` (fingerprint), `accepted/` (snapshot), `build/` (generated context), `built.tag` (and `built-sudo.tag`, one per base variant) |
+| `~/.config/claude-sandbox/overlays/_global/` | The same launcher-owned bits for the global overlay (`build/`, `built*.tag`) — no snapshot, since it is not gated |
 | `~/.config/claude-sandbox/containers/<name>.image` | Which image a running VM was created from, for the staleness check |
-| `~/.config/claude-sandbox/base-<user>.stamp` | Bumped on every base-image rebuild, so overlays rebuild on top of it |
+| `~/.config/claude-sandbox/base-<user>.stamp` | Bumped on every base-image rebuild, so overlays rebuild on top of it. `base-<user>-sudo.stamp` is the same for the `--sudo` variant |
 | `~/.claude-sandbox/` | Mounted as `~/.claude` in every VM — the persistent Claude Code login and settings |
 
 ## Releasing
@@ -586,10 +709,14 @@ Users pick the new version up on their next `brew update && brew upgrade`.
   [step 5](#5-lift-zeds-restricted-mode).
 - **Dockerfile edits appear to do nothing** — for the *base* image
   (`Dockerfile` in this repo), rebuild the binary (`cargo build --release`);
-  the image sources are compiled in. For a *project's*
-  `.claude-sandbox/Dockerfile`, the launcher picks changes up on the next
-  launch and asks you to accept them — check `claude-sandbox overlay <dir>` if
-  it didn't.
+  the image sources are compiled in. Then `rebuild --use-cache`, which is the
+  seconds-long form. For a *project's* `.claude-sandbox/Dockerfile`, the
+  launcher picks changes up on the next launch and asks you to accept them —
+  check `claude-sandbox overlay <dir>` if it didn't.
+- **A package in the image is out of date, and rebuilding doesn't move it** —
+  you are getting the builder's cached layer. That is what plain `rebuild`
+  (no `--use-cache`) exists for; see [Keeping images up to
+  date](#keeping-images-up-to-date).
 - **`git checkout` in the VM fails with "Read-only file system"** — the branch
   you are switching to has a different `.claude-sandbox/`, which is mounted
   read-only in the guest. Do that checkout on the host; see
@@ -597,3 +724,9 @@ Users pick the new version up on their next `brew update && brew upgrade`.
 - **"the overlay must be accepted before it is built"** — a non-interactive run
   hit an unaccepted overlay. Accept it deliberately with
   `claude-sandbox overlay --accept <dir>`, or pass `--no-overlay`.
+- **`sudo: <user> is not in the sudoers file`, or `apt-get`/`npm install -g`
+  failing with `Permission denied`** — working as intended: the VM's account
+  cannot become root. Put the package in an [image
+  overlay](#image-overlays), or launch with
+  [`--sudo`](#root-inside-the-vm) if you want root in the VM itself and accept
+  what that costs.

@@ -6,8 +6,9 @@
 // `cargo build` for image rebuilds to pick it up.
 
 use anyhow::{anyhow, bail, Context, Result};
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io;
@@ -63,66 +64,156 @@ const REVIEW_MAX_LINES: usize = 200;
 const DEFAULT_MEMORY: &str = "8g";
 const DEFAULT_CPUS: &str = "6";
 
-const USAGE: &str = "\
-claude-sandbox — run a project directory inside a claude-sandbox VM and open
-Zed on the host connected to it over SSH.
+// One paragraph, deliberately: a second one would make clap treat --help as
+// "long help" and print a spaced-out page twice the length of -h.
+/// Run a project directory inside a claude-sandbox VM and open Zed over SSH
+#[derive(Parser)]
+#[command(
+    name = "claude-sandbox",
+    version,
+    // A bare <dir> is the default mode, so its arguments and the modes below
+    // are alternatives rather than something to be combined.
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    disable_help_subcommand = true,
+    after_help = "With no mode, <DIR> starts the VM, building and creating whatever is\n\
+                  missing. The README covers the security model, image overlays,\n\
+                  environment variables, and where state lives on the host."
+)]
+struct Cli {
+    #[command(subcommand)]
+    mode: Option<Mode>,
+    #[command(flatten)]
+    up: UpArgs,
+}
 
-usage:
-  claude-sandbox [opts] <dir>                 start the VM (build/create as needed), open Zed
-  claude-sandbox shell [opts] <dir> [cmd...]  same, but ssh in instead of opening Zed
-  claude-sandbox stop <dir>                   stop the project's VM (it deletes itself on stop)
-  claude-sandbox rm <dir>                     stop and delete the project's VM
-  claude-sandbox overlay [action] <dir>       inspect or manage the project's image overlay
-  claude-sandbox --rebuild <dir>              rebuild the image, recreate the VM, open Zed
+#[derive(Subcommand)]
+enum Mode {
+    /// Same, but ssh in instead of opening Zed
+    Shell(ShellArgs),
+    /// Stop the project's VM (it deletes itself on stop)
+    Stop(DirArg),
+    /// Stop and delete the VM, and drop its ssh-config block
+    Rm(DirArg),
+    /// Inspect or manage the project's image overlay
+    Overlay(OverlayArgs),
+    /// Rebuild every image layer from scratch, then stop
+    Rebuild(RebuildArgs),
+}
 
-Options (memory/cpus are read when the VM is created; a running VM keeps the
-limits it was created with, so change them with `rm` first):
-  -m, --memory <size>  memory ceiling, K/M/G/T/P suffix required (default: 8g)
-  -c, --cpus <n>       vCPUs; the guest sees one more than this (default: 6)
-      --rebuild        rebuild the image and recreate the VM
-      --no-overlay     ignore both overlays for this run (boot the plain base image)
-      --accept-overlay accept the project overlay's contents without prompting
+/// Flags that decide which image is wanted. Shared by every mode that can
+/// build one, and absent from the modes that cannot — so `stop --sudo` is
+/// rejected by the parser rather than by a hand-written check downstream.
+#[derive(Args, Clone, Default)]
+struct ImageArgs {
+    /// Give the VM's account passwordless root
+    #[arg(long)]
+    sudo: bool,
+    /// Ignore both overlays and boot the plain base image
+    #[arg(long)]
+    no_overlay: bool,
+    /// Accept the project overlay's contents without prompting
+    #[arg(long)]
+    accept_overlay: bool,
+}
 
-Overlay actions (for `claude-sandbox overlay`):
-  (none)      show status, and a diff if the overlay is unaccepted
-  --accept    accept the current contents
-  --revert    restore the last accepted contents into the project
-  --forget    drop the acceptance record and the stored snapshot
+/// Flags read when a VM is created, so only the modes that create one take
+/// them.
+#[derive(Args, Clone)]
+struct VmArgs {
+    /// Memory ceiling; K/M/G/T/P suffix required
+    #[arg(short, long, value_name = "SIZE", default_value = DEFAULT_MEMORY,
+          value_parser = parse_memory)]
+    memory: String,
+    /// vCPUs; the guest sees one more than this
+    #[arg(short, long, value_name = "N", default_value = DEFAULT_CPUS,
+          value_parser = parse_cpus)]
+    cpus: String,
+}
 
-Image overlays (base -> global -> project):
-  ~/.config/claude-sandbox/global/Dockerfile, if it exists, is layered onto
-  every project's image. It is yours and no sandbox can reach it, so it is
-  built as-is; edit it and the next launch rebuilds.
+#[derive(Args)]
+struct UpArgs {
+    #[command(flatten)]
+    image: ImageArgs,
+    #[command(flatten)]
+    vm: VmArgs,
+    /// Project directory
+    // Optional only so that a mode can take the directory instead: a flattened
+    // struct is built from the matches even when a subcommand consumed them,
+    // so a required field here fails every `stop`/`rm`/... invocation.
+    // Absence is reported as a missing argument in run().
+    dir: Option<String>,
+    /// Superseded by the `rebuild` mode; kept to say so.
+    #[arg(long, hide = true)]
+    rebuild: bool,
+}
 
-  <dir>/.claude-sandbox/Dockerfile is then layered on top of that, with that
-  directory as the build context. It comes from the project's repository and
-  runs as root at build time, so nothing is built until you have seen the
-  contents and accepted them; the accepted bytes are recorded under
-  ~/.config/claude-sandbox and any later change re-prompts with a diff. The
-  directory is mounted read-only inside the VM, so writes to it from in there
-  fail.
+#[derive(Args)]
+struct ShellArgs {
+    #[command(flatten)]
+    image: ImageArgs,
+    #[command(flatten)]
+    vm: VmArgs,
+    /// Project directory
+    dir: String,
+    /// Command to run instead of an interactive shell
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "CMD")]
+    argv: Vec<String>,
+}
 
-State:
-  ~/.config/claude-sandbox/   dedicated ssh key, managed ssh config, overlay records
-  ~/.config/claude-sandbox/global/  Dockerfile layered onto every project
-  ~/.claude-sandbox/          mounted as ~/.claude in every VM (Claude login)
+#[derive(Args)]
+struct DirArg {
+    /// Project directory
+    dir: String,
+}
 
-A VM deletes itself ~15 seconds after its last ssh session ends (Zed window
-closed, shell exited); reopening the project recreates it in seconds. A fresh
-VM gets 2 minutes to receive its first connection.
+#[derive(Args)]
+struct OverlayArgs {
+    /// Project directory
+    dir: String,
+    #[command(flatten)]
+    action: OverlayActionArgs,
+}
 
-Environment:
-  CLAUDE_SANDBOX_IDLE=<seconds>  idle timeout, applied when the VM is created (0 = never reap)
-  CLAUDE_SANDBOX_DEBUG=1         keep failed VMs around (skips --rm) so `container logs` works
-  CLAUDE_SANDBOX_USER=<name>     account inside the VM (default: your host username)
-  CLAUDE_SANDBOX_RESEED=1        overwrite the VM's Claude credentials from the host keychain
-  CLAUDE_SANDBOX_ACCEPT_OVERLAY=1  accept overlay contents without prompting (for scripts)
+/// At most one action; with none, `overlay` reports status.
+#[derive(Args)]
+#[group(multiple = false)]
+struct OverlayActionArgs {
+    /// Accept the overlay's current contents
+    #[arg(long)]
+    accept: bool,
+    /// Restore the last accepted contents into the project
+    #[arg(long)]
+    revert: bool,
+    /// Drop the acceptance record and the stored snapshot
+    #[arg(long)]
+    forget: bool,
+}
 
-Claude Code inside the VM is seeded from the host on every run: OAuth tokens
-exported from the login Keychain, plus settings.json, CLAUDE.md, agents,
-commands, skills, output-styles and plugins. This is a one-way copy, never a
-mount of ~/.claude — transcripts stay on the host, and nothing the VM writes
-can reach config the host executes.";
+impl OverlayActionArgs {
+    fn action(&self) -> OverlayAction {
+        if self.accept {
+            OverlayAction::Accept
+        } else if self.revert {
+            OverlayAction::Revert
+        } else if self.forget {
+            OverlayAction::Forget
+        } else {
+            OverlayAction::Status
+        }
+    }
+}
+
+#[derive(Args)]
+struct RebuildArgs {
+    #[command(flatten)]
+    image: ImageArgs,
+    /// Reuse cached layers; picks up Dockerfile edits only
+    #[arg(long)]
+    use_cache: bool,
+    /// Project directory
+    dir: String,
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum Cmd {
@@ -131,6 +222,7 @@ enum Cmd {
     Stop,
     Rm,
     Overlay,
+    Rebuild,
 }
 
 /// What `claude-sandbox overlay` was asked to do.
@@ -142,110 +234,68 @@ enum OverlayAction {
     Forget,
 }
 
-/// Flags accepted before the directory (and, for `up`, after it too). Values
-/// stay `None` when unset so `stop`/`rm` can reject flags that only mean
-/// something at creation time.
-#[derive(Default)]
+/// What the parsed command line means to the rest of the launcher, flattened
+/// out of the per-mode argument structs. Every mode fills in whatever it
+/// accepts and leaves the rest at its default; a mode that does not take a
+/// flag can never observe one, because the parser rejects it first.
 struct Opts {
-    rebuild: bool,
-    memory: Option<String>,
-    cpus: Option<String>,
+    memory: String,
+    cpus: String,
     no_overlay: bool,
     accept_overlay: bool,
-    overlay_action: Option<OverlayAction>,
+    sudo: bool,
+    use_cache: bool,
 }
 
-impl Opts {
-    /// Consume leading flags, stopping at the first argument that is not one —
-    /// the directory, or (for `shell`) the start of the ssh command.
-    fn take_from(&mut self, args: &mut VecDeque<String>) -> Result<()> {
-        while let Some(head) = args.front().cloned() {
-            let (name, inline) = match head.split_once('=') {
-                Some((n, v)) => (n, Some(v.to_string())),
-                None => (head.as_str(), None),
-            };
-            match name {
-                "--rebuild" => {
-                    if inline.is_some() {
-                        bail!("--rebuild takes no value");
-                    }
-                    args.pop_front();
-                    self.rebuild = true;
-                }
-                "--memory" | "-m" => {
-                    let v = take_value(args, name, inline)?;
-                    self.memory = Some(parse_memory(&v)?);
-                }
-                "--cpus" | "-c" => {
-                    let v = take_value(args, name, inline)?;
-                    self.cpus = Some(parse_cpus(&v)?);
-                }
-                "--no-overlay" | "--accept-overlay" => {
-                    if inline.is_some() {
-                        bail!("{name} takes no value");
-                    }
-                    args.pop_front();
-                    if name == "--no-overlay" {
-                        self.no_overlay = true;
-                    } else {
-                        self.accept_overlay = true;
-                    }
-                }
-                "--accept" | "--revert" | "--forget" => {
-                    if inline.is_some() {
-                        bail!("{name} takes no value");
-                    }
-                    args.pop_front();
-                    if self.overlay_action.is_some() {
-                        bail!("pick one overlay action: --accept, --revert or --forget");
-                    }
-                    self.overlay_action = Some(match name {
-                        "--accept" => OverlayAction::Accept,
-                        "--revert" => OverlayAction::Revert,
-                        _ => OverlayAction::Forget,
-                    });
-                }
-                _ => break,
-            }
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            memory: DEFAULT_MEMORY.to_string(),
+            cpus: DEFAULT_CPUS.to_string(),
+            no_overlay: false,
+            accept_overlay: false,
+            sudo: false,
+            use_cache: false,
         }
-        Ok(())
     }
 }
 
-/// Pull a flag's value, accepting both `--flag value` and `--flag=value`.
-fn take_value(args: &mut VecDeque<String>, flag: &str, inline: Option<String>) -> Result<String> {
-    args.pop_front();
-    match inline {
-        Some(v) => Ok(v),
-        None => args.pop_front().ok_or_else(|| anyhow!("{flag} needs a value")),
+impl From<ImageArgs> for Opts {
+    fn from(a: ImageArgs) -> Self {
+        Opts {
+            sudo: a.sudo,
+            no_overlay: a.no_overlay,
+            accept_overlay: a.accept_overlay,
+            ..Opts::default()
+        }
     }
 }
 
 /// Validate a memory ceiling and normalise it for `container -m`. The suffix
 /// is required: the runtime reads a bare number as mebibytes, which turns a
 /// plausible `--memory 8` into 8 MiB rather than the 8 GiB it looks like.
+// Both of these are clap value parsers, and clap already prints the flag and
+// the offending value around whatever they return — so the messages say only
+// what was wrong.
 fn parse_memory(v: &str) -> Result<String> {
     let s = v.trim().to_lowercase();
     let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-    let n: u64 = digits
-        .parse()
-        .map_err(|_| anyhow!("--memory: expected a size like 8g or 8192m, got: {v}"))?;
+    let n: u64 = digits.parse().map_err(|_| anyhow!("expected a size like 8g or 8192m"))?;
     if n == 0 {
-        bail!("--memory must be greater than 0");
+        bail!("must be greater than 0");
     }
     match &s[digits.len()..] {
-        "" => bail!("--memory: {v} needs a unit suffix (K, M, G, T or P), e.g. {v}g"),
+        "" => bail!("needs a unit suffix (K, M, G, T or P), e.g. {v}g"),
         "k" | "m" | "g" | "t" | "p" | "kb" | "mb" | "gb" | "tb" | "pb" | "kib" | "mib" | "gib"
         | "tib" | "pib" => Ok(s),
-        other => bail!("--memory: unknown suffix {other:?} in {v} (use K, M, G, T or P)"),
+        other => bail!("unknown suffix {other:?} (use K, M, G, T or P)"),
     }
 }
 
 fn parse_cpus(v: &str) -> Result<String> {
-    let n: u32 =
-        v.trim().parse().map_err(|_| anyhow!("--cpus: expected a whole number, got: {v}"))?;
+    let n: u32 = v.trim().parse().map_err(|_| anyhow!("expected a whole number"))?;
     if n == 0 {
-        bail!("--cpus must be at least 1");
+        bail!("must be at least 1");
     }
     Ok(n.to_string())
 }
@@ -267,6 +317,59 @@ fn memory_bytes(s: &str) -> Option<u64> {
     n.checked_mul(mult)
 }
 
+/// The image the base Dockerfile builds on, so `rebuild` can re-pull it.
+/// Read out of the embedded file rather than written down twice, which is the
+/// only way the two cannot drift apart. `--platform=…` and friends are skipped
+/// so a flag ahead of the reference is not mistaken for one.
+fn base_from_image(dockerfile: &str) -> Option<&str> {
+    for line in dockerfile.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let mut tokens = trimmed.split_whitespace();
+        if tokens
+            .next()
+            .is_some_and(|k| k.eq_ignore_ascii_case("FROM"))
+        {
+            return tokens.find(|t| !t.starts_with("--"));
+        }
+    }
+    None
+}
+
+/// Named when a build that discarded the cache fails. `--no-cache` is the one
+/// build flag here whose support is the runtime's to grant rather than this
+/// launcher's, so a failure on it should say which flag to drop rather than
+/// leave that to be guessed.
+const NO_CACHE_HINT: &str = "this build ran with --no-cache, which `rebuild` implies.\n  \
+     if it failed on that flag rather than on the build itself, re-run with:  \
+     rebuild --use-cache";
+
+/// What separates the privileged base image (and its build stamp) from the
+/// default one, so the two can never share a tag or invalidate each other.
+fn variant(sudo: bool) -> &'static str {
+    if sudo {
+        "-sudo"
+    } else {
+        ""
+    }
+}
+
+/// Whether an environment switch is on. The other CLAUDE_SANDBOX_* variables
+/// read any value at all as "yes", which is fine for them; this one grants
+/// root, and `CLAUDE_SANDBOX_SUDO=0` meaning "yes" is a footgun worth the one
+/// special case.
+fn env_enabled(key: &str) -> bool {
+    match env::var(key) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 fn human_bytes(b: u64) -> String {
     if b.is_multiple_of(1 << 30) {
         format!("{}g", b >> 30)
@@ -277,7 +380,8 @@ fn human_bytes(b: u64) -> String {
 
 struct Sandbox {
     user: String,
-    /// The shared image every project starts from, one per guest account.
+    /// The shared image every project starts from, one per guest account and
+    /// privilege variant.
     base_image: String,
     home: PathBuf,
     state_dir: PathBuf,
@@ -299,6 +403,13 @@ struct Sandbox {
     overlay_state: PathBuf,
     memory: String,
     cpus: String,
+    /// Whether the guest account can become root. Baked into the image, so it
+    /// is part of the base image's identity rather than a runtime switch.
+    sudo: bool,
+    /// Whether this run's builds discard the builder's layer cache. Set by the
+    /// `rebuild` mode, since re-running a build that answers every step from
+    /// cache is not a rebuild in the sense anyone asks for one.
+    no_cache: bool,
 }
 
 fn main() {
@@ -309,87 +420,56 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut args: VecDeque<String> = env::args().skip(1).collect();
+    let cli = Cli::parse();
 
-    let cmd = match args.front().map(String::as_str) {
+    // Which flags each mode accepts is settled by the parser, so what is left
+    // here is only the mapping onto what the launcher does.
+    let (cmd, dir, opts, ssh_args, overlay_action) = match cli.mode {
         None => {
-            eprintln!("{USAGE}");
-            std::process::exit(1);
+            // The flag the mode replaced. Hidden rather than dropped: it
+            // shipped in the README and a Homebrew tap, so it should land
+            // somewhere better than "unexpected argument".
+            if cli.up.rebuild {
+                bail!(
+                    "--rebuild is a mode now:  claude-sandbox rebuild <dir>\n  \
+                     with cached layers:       claude-sandbox rebuild --use-cache <dir>"
+                );
+            }
+            let a = cli.up;
+            let Some(dir) = a.dir else {
+                // Raised through clap so it reads and exits like every other
+                // argument error, rather than as a launcher failure.
+                Cli::command()
+                    .error(
+                        ErrorKind::MissingRequiredArgument,
+                        "the following required arguments were not provided:\n  <DIR>",
+                    )
+                    .exit()
+            };
+            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, ..a.image.into() };
+            (Cmd::Up, dir, opts, Vec::new(), OverlayAction::Status)
         }
-        Some("-h" | "--help") => {
-            println!("{USAGE}");
-            return Ok(());
+        Some(Mode::Shell(a)) => {
+            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, ..a.image.into() };
+            (Cmd::Shell, a.dir, opts, a.argv, OverlayAction::Status)
         }
-        Some("shell") => {
-            args.pop_front();
-            Cmd::Shell
+        Some(Mode::Stop(a)) => (Cmd::Stop, a.dir, Opts::default(), Vec::new(), OverlayAction::Status),
+        Some(Mode::Rm(a)) => (Cmd::Rm, a.dir, Opts::default(), Vec::new(), OverlayAction::Status),
+        Some(Mode::Overlay(a)) => {
+            (Cmd::Overlay, a.dir, Opts::default(), Vec::new(), a.action.action())
         }
-        Some("stop") => {
-            args.pop_front();
-            Cmd::Stop
+        Some(Mode::Rebuild(a)) => {
+            let opts = Opts { use_cache: a.use_cache, ..a.image.into() };
+            (Cmd::Rebuild, a.dir, opts, Vec::new(), OverlayAction::Status)
         }
-        Some("rm") => {
-            args.pop_front();
-            Cmd::Rm
-        }
-        Some("overlay") => {
-            args.pop_front();
-            Cmd::Overlay
-        }
-        Some(_) => Cmd::Up,
     };
-
-    let mut opts = Opts::default();
-    opts.take_from(&mut args)?;
-
-    let Some(dir) = args.pop_front() else {
-        eprintln!("{USAGE}");
-        std::process::exit(1);
-    };
-    // take_from stops at the first non-flag, so an unrecognised flag lands
-    // here and would otherwise be reported as the directory.
-    if dir.starts_with('-') {
-        bail!("unknown option: {dir}");
-    }
-
-    // Only `shell` forwards trailing arguments (to ssh). Elsewhere they are
-    // mistakes — except flags, which are also accepted after the dir.
-    let ssh_args: Vec<String> = if cmd == Cmd::Shell {
-        args.into()
-    } else {
-        opts.take_from(&mut args)?;
-        if let Some(a) = args.pop_front() {
-            bail!("unexpected argument: {a}");
-        }
-        Vec::new()
-    };
-
-    // These only take effect while creating something, and neither a VM that
-    // is about to be deleted nor a pure host-side overlay query is that.
-    // Silently ignoring them would look like they had resized an existing VM.
-    if matches!(cmd, Cmd::Stop | Cmd::Rm | Cmd::Overlay) {
-        let what = if cmd == Cmd::Overlay { "overlay" } else { "stop/rm" };
-        if opts.rebuild {
-            bail!("--rebuild has no effect on {what}");
-        }
-        if opts.memory.is_some() || opts.cpus.is_some() {
-            bail!("--memory/--cpus have no effect on {what}");
-        }
-        if opts.no_overlay || opts.accept_overlay {
-            bail!("--no-overlay/--accept-overlay have no effect on {what}");
-        }
-    }
-    // The overlay actions name what `overlay` should do; anywhere else they
-    // would read as a request the launcher silently ignored.
-    if cmd != Cmd::Overlay && opts.overlay_action.is_some() {
-        bail!("--accept/--revert/--forget are actions for `claude-sandbox overlay <dir>`");
-    }
 
     let sb = Sandbox::new(&dir, cmd, &opts)?;
     match cmd {
         Cmd::Stop => sb.stop(),
         Cmd::Rm => sb.remove(),
-        Cmd::Overlay => sb.overlay_cmd(opts.overlay_action.unwrap_or(OverlayAction::Status)),
+        Cmd::Overlay => sb.overlay_cmd(overlay_action),
+        Cmd::Rebuild => sb.rebuild(&opts),
         Cmd::Up | Cmd::Shell => sb.up(cmd, &opts, &ssh_args),
     }
 }
@@ -400,7 +480,11 @@ fn token_expiry(json: &str) -> u64 {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return 0;
     };
-    let node = if v.get("claudeAiOauth").is_some() { &v["claudeAiOauth"] } else { &v };
+    let node = if v.get("claudeAiOauth").is_some() {
+        &v["claudeAiOauth"]
+    } else {
+        &v
+    };
     node["expiresAt"].as_u64().unwrap_or(0)
 }
 
@@ -498,7 +582,11 @@ fn scan_into(root: &Path, dir: &Path, out: &mut Vec<CtxEntry>, total: &mut u64) 
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
         let ty = entry.file_type()?;
         if ty.is_symlink() {
             // Recorded as the link, never followed: a link pointing out of the
@@ -575,7 +663,10 @@ fn check_fragment(text: &str) -> Result<String> {
         continued = !comment && trimmed.ends_with('\\');
         if directive {
             let mut tokens = trimmed.split_whitespace();
-            if tokens.next().is_some_and(|k| k.eq_ignore_ascii_case("FROM")) {
+            if tokens
+                .next()
+                .is_some_and(|k| k.eq_ignore_ascii_case("FROM"))
+            {
                 if tokens.next() == Some("claude-sandbox-base") && tokens.next().is_none() {
                     continue;
                 }
@@ -600,7 +691,13 @@ fn check_fragment(text: &str) -> Result<String> {
 /// status is ignored; if it cannot be run at all, show the current contents
 /// instead — an unreadable prompt is worse than a verbose one.
 fn show_diff(accepted: &Path, current: &Path) {
-    if Command::new("diff").arg("-ruN").arg(accepted).arg(current).status().is_err() {
+    if Command::new("diff")
+        .arg("-ruN")
+        .arg(accepted)
+        .arg(current)
+        .status()
+        .is_err()
+    {
         eprintln!("(no `diff` available — showing the current contents in full instead)");
         if let Ok(entries) = scan_context(current) {
             show_context(&entries);
@@ -612,14 +709,22 @@ fn show_diff(accepted: &Path, current: &Path) {
 fn show_context(entries: &[CtxEntry]) {
     for e in entries {
         if e.link {
-            println!("--- {} -> {} (symlink)", e.path, String::from_utf8_lossy(&e.data));
+            println!(
+                "--- {} -> {} (symlink)",
+                e.path,
+                String::from_utf8_lossy(&e.data)
+            );
             continue;
         }
         let Ok(text) = std::str::from_utf8(&e.data) else {
             println!("--- {} ({} bytes, not text)", e.path, e.data.len());
             continue;
         };
-        println!("--- {}{}", e.path, if e.exec { " (executable)" } else { "" });
+        println!(
+            "--- {}{}",
+            e.path,
+            if e.exec { " (executable)" } else { "" }
+        );
         let mut lines = text.lines();
         for line in lines.by_ref().take(REVIEW_MAX_LINES) {
             println!("    {line}");
@@ -703,6 +808,10 @@ impl Sandbox {
         let overlay_src = abs.join(OVERLAY_DIR);
         let global_src = state_dir.join(GLOBAL_DIR);
 
+        // The flag and the environment variable are equivalent; either one
+        // asks for the privileged image.
+        let sudo = opts.sudo || env_enabled("CLAUDE_SANDBOX_SUDO");
+
         Ok(Sandbox {
             key: state_dir.join("id_ed25519"),
             ssh_conf: state_dir.join("ssh_config"),
@@ -712,9 +821,13 @@ impl Sandbox {
             // The account is baked into the image, so it belongs in the tag:
             // a different CLAUDE_SANDBOX_USER then builds its own image rather
             // than silently booting one whose only account it cannot log in as.
-            base_image: format!("{IMAGE_REPO}:{user}"),
-            memory: opts.memory.clone().unwrap_or_else(|| DEFAULT_MEMORY.to_string()),
-            cpus: opts.cpus.clone().unwrap_or_else(|| DEFAULT_CPUS.to_string()),
+            // So does whether that account can become root — the two variants
+            // differ only in their last few layers, and reusing one for the
+            // other would either break every `apt-get` or hand back the root
+            // the default exists to withhold, in both cases without saying so.
+            base_image: format!("{IMAGE_REPO}:{user}{}", variant(sudo)),
+            memory: opts.memory.clone(),
+            cpus: opts.cpus.clone(),
             proj_id,
             overlay_src,
             overlay_state,
@@ -723,6 +836,10 @@ impl Sandbox {
             home,
             state_dir,
             abs,
+            sudo,
+            // A first build has no cache to distrust — only an explicit
+            // rebuild says the layers already there are the problem.
+            no_cache: cmd == Cmd::Rebuild && !opts.use_cache,
         })
     }
 
@@ -733,7 +850,10 @@ impl Sandbox {
             return Ok(());
         }
         capture("container", &["stop", &self.name])?;
-        println!("stopped {} (it deletes itself; reopen the project to recreate)", self.name);
+        println!(
+            "stopped {} (it deletes itself; reopen the project to recreate)",
+            self.name
+        );
         Ok(())
     }
 
@@ -785,26 +905,18 @@ impl Sandbox {
         let _ = fs::write(&self.ssh_conf, kept);
     }
 
-    fn up(&self, cmd: Cmd, opts: &Opts, ssh_args: &[String]) -> Result<()> {
-        let domain = preflight()?;
-        self.ensure_key()?;
-        self.seed_claude_config()?;
-
+    /// Build every image this project needs and return the one a container
+    /// should run: base -> global -> project, each layer on whatever is
+    /// beneath it. `force_base` rebuilds the base even when it already exists.
+    fn ensure_images(&self, opts: &Opts, force_base: bool) -> Result<String> {
         // Ask about the overlay before building anything: the answer decides
         // which image is wanted, and "skip" should not arrive after a build.
         let overlay = self.resolve_overlay(opts)?;
         let global = self.resolve_global(opts)?;
 
-        if opts.rebuild || !self.have_image(&self.base_image)? {
+        if force_base || !self.have_image(&self.base_image)? {
             self.build_image()?;
-            // A base rebuild keeps the same tag, so the image-change check in
-            // ensure_container cannot see it; say so explicitly.
-            if opts.rebuild && self.state()?.is_some() {
-                self.destroy();
-                println!("recreating {} with the new image", self.name);
-            }
         }
-        // base -> global -> project, each layer built on whatever is beneath it.
         let mut image = self.base_image.clone();
         if let Some(fp) = &global {
             image = self.ensure_global_image(fp)?;
@@ -812,7 +924,46 @@ impl Sandbox {
         if let Some(fp) = &overlay {
             image = self.ensure_overlay_image(fp, &image)?;
         }
+        Ok(image)
+    }
 
+    /// Rebuild the images and stop. No key, no config seeding, no VM, no
+    /// connection — the next launch does all of that, and doing it here would
+    /// mean a command whose whole purpose is a long build also decides it is
+    /// time to open an editor.
+    fn rebuild(&self, opts: &Opts) -> Result<()> {
+        // Not preflight(): building needs the services running, but nothing
+        // here resolves a host name, so its DNS warning would be noise.
+        ensure_services()?;
+        self.ensure_images(opts, true)?;
+
+        // A base rebuild keeps the same tag, so ensure_container's
+        // image-change check cannot see it — a VM left running would be reused
+        // as though it were current, quietly serving the layers this command
+        // was run to replace. Drop it; the next launch recreates it in seconds.
+        if self.state()?.is_some() {
+            self.destroy();
+            println!("deleted {} — it was running the previous image", self.name);
+        }
+        Ok(())
+    }
+
+    fn up(&self, cmd: Cmd, opts: &Opts, ssh_args: &[String]) -> Result<()> {
+        // Said on every launch rather than once: this is the one setting that
+        // changes what the VM is for, and it can arrive from the environment
+        // rather than from the command that was typed.
+        if self.sudo {
+            println!(
+                "--sudo: this VM's account has passwordless root, so nothing enforced \
+                 inside it — the egress firewall, the read-only overlay mount — is a \
+                 barrier to anything running in there"
+            );
+        }
+        let domain = preflight()?;
+        self.ensure_key()?;
+        self.seed_claude_config()?;
+
+        let image = self.ensure_images(opts, false)?;
         self.ensure_container(&image)?;
         // Connect by IP, not by name: the runtime's DNS record appears some
         // seconds after the container does, and a lookup made in that window
@@ -886,8 +1037,13 @@ impl Sandbox {
         // transcripts, history, caches, telemetry, machine-local settings —
         // is intentionally left behind.
         const COPY: &[&str] = &[
-            "settings.json", "CLAUDE.md", "agents", "commands",
-            "skills", "output-styles", "plugins",
+            "settings.json",
+            "CLAUDE.md",
+            "agents",
+            "commands",
+            "skills",
+            "output-styles",
+            "plugins",
         ];
         let src_root = self.home.join(".claude");
         for name in COPY {
@@ -907,7 +1063,12 @@ impl Sandbox {
         let dest = self.claude_dir.join(".credentials.json");
         let host = match capture(
             "security",
-            &["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            &[
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ],
         ) {
             Ok(s) => s,
             Err(_) => {
@@ -948,8 +1109,17 @@ impl Sandbox {
         fs::create_dir_all(&self.state_dir)?;
         capture(
             "ssh-keygen",
-            &["-q", "-t", "ed25519", "-N", "", "-C", "claude-sandbox",
-              "-f", &self.key.to_string_lossy()],
+            &[
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "claude-sandbox",
+                "-f",
+                &self.key.to_string_lossy(),
+            ],
         )?;
         println!("generated ssh key {}", self.key.display());
         Ok(())
@@ -982,18 +1152,49 @@ impl Sandbox {
             .collect();
         let pubkeys = keys.join("\\n");
 
+        // Discarding the cache re-runs every RUN, but `FROM` still resolves to
+        // whatever copy of the OS image is already local — so a rebuild meant
+        // to pick up upstream changes would sit on a rootfs that never moves.
+        // Best-effort: offline, or a registry having a bad day, should mean a
+        // build on the local copy rather than no build at all.
+        if self.no_cache {
+            if let Some(from) = base_from_image(DOCKERFILE) {
+                println!("pulling {from} ...");
+                if let Err(e) = passthrough("container", &["image", "pull", from]) {
+                    eprintln!(
+                        "claude-sandbox: warning: could not pull {from} ({e:#});\n  \
+                         building on the copy already here, which may be older than \
+                         the registry's"
+                    );
+                }
+            }
+        }
+
         // Build from a temp context holding the embedded Dockerfile/entrypoint.
         let ctx = env::temp_dir().join(format!("claude-sandbox-ctx-{}", std::process::id()));
         fs::create_dir_all(&ctx)?;
         fs::write(ctx.join("Dockerfile"), DOCKERFILE)?;
         fs::write(ctx.join("entrypoint.sh"), ENTRYPOINT)?;
-        let built = passthrough(
-            "container",
-            &["build", "-t", self.base_image.as_str(),
-              "--build-arg", &format!("SSH_PUBKEY={pubkeys}"),
-              "--build-arg", &format!("USERNAME={}", self.user),
-              &ctx.to_string_lossy()],
-        );
+        let pubkey_arg = format!("SSH_PUBKEY={pubkeys}");
+        let user_arg = format!("USERNAME={}", self.user);
+        let sudo_arg = format!("SUDO={}", self.sudo as u8);
+        let ctx_arg = ctx.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec![
+            "build",
+            "-t",
+            self.base_image.as_str(),
+            "--build-arg",
+            &pubkey_arg,
+            "--build-arg",
+            &user_arg,
+            "--build-arg",
+            &sudo_arg,
+        ];
+        if self.no_cache {
+            args.push("--no-cache");
+        }
+        args.push(&ctx_arg);
+        let built = self.cache_context(passthrough("container", &args));
         let _ = fs::remove_dir_all(&ctx);
         built?;
         self.bump_base_stamp()
@@ -1003,14 +1204,30 @@ impl Sandbox {
         Ok(capture("container", &["image", "inspect", tag]).is_ok())
     }
 
+    /// Attach `NO_CACHE_HINT` to a failed build, but only when the cache was
+    /// actually being discarded — on an ordinary build it is noise pointing at
+    /// a flag that was never passed.
+    fn cache_context(&self, built: Result<()>) -> Result<()> {
+        if self.no_cache {
+            built.context(NO_CACHE_HINT)
+        } else {
+            built
+        }
+    }
+
     /// A value that changes every time the base image is actually rebuilt.
     ///
     /// Overlay images sit on top of the base, so a base rebuild leaves every
     /// project's overlay stale — but the base keeps its tag across rebuilds,
     /// so the tag cannot say so. Folding this stamp into each overlay's tag
     /// makes any base rebuild, from any project, invalidate them all.
+    ///
+    /// Kept per variant as well as per account, so rebuilding the `--sudo`
+    /// base does not send every ordinary project's overlay through a rebuild
+    /// it gains nothing from.
     fn base_stamp_path(&self) -> PathBuf {
-        self.state_dir.join(format!("base-{}.stamp", self.user))
+        self.state_dir
+            .join(format!("base-{}{}.stamp", self.user, variant(self.sudo)))
     }
 
     fn base_stamp(&self) -> Result<String> {
@@ -1072,7 +1289,11 @@ impl Sandbox {
         }
 
         let snap = self.overlay_snapshot();
-        let accepted = if snap.is_dir() { Some(scan_context(&snap)?) } else { None };
+        let accepted = if snap.is_dir() {
+            Some(scan_context(&snap)?)
+        } else {
+            None
+        };
         // Compared byte for byte rather than by fingerprint: the hash is what
         // gets recorded and what names the image, but the gate itself owes
         // nothing to the hash function holding up.
@@ -1129,8 +1350,15 @@ impl Sandbox {
             "project": self.abs.to_string_lossy(),
             "accepted_at": at,
         });
-        fs::write(self.overlay_record(), format!("{}\n", serde_json::to_string_pretty(&record)?))?;
-        println!("accepted the image overlay for {} ({}…)", self.abs.display(), &fp[..12]);
+        fs::write(
+            self.overlay_record(),
+            format!("{}\n", serde_json::to_string_pretty(&record)?),
+        )?;
+        println!(
+            "accepted the image overlay for {} ({}…)",
+            self.abs.display(),
+            &fp[..12]
+        );
         Ok(fp)
     }
 
@@ -1141,7 +1369,10 @@ impl Sandbox {
     fn revert_overlay(&self) -> Result<()> {
         let snap = self.overlay_snapshot();
         if !snap.is_dir() {
-            bail!("nothing to revert to: no accepted overlay recorded for {}", self.abs.display());
+            bail!(
+                "nothing to revert to: no accepted overlay recorded for {}",
+                self.abs.display()
+            );
         }
         // Restoring into a project that is no longer there would conjure the
         // directory back into existence holding nothing but the overlay.
@@ -1152,7 +1383,10 @@ impl Sandbox {
             fs::remove_dir_all(&self.overlay_src)?;
         }
         copy_context(&snap, &self.overlay_src)?;
-        println!("reverted {} to the accepted contents", self.overlay_src.display());
+        println!(
+            "reverted {} to the accepted contents",
+            self.overlay_src.display()
+        );
         Ok(())
     }
 
@@ -1306,7 +1540,10 @@ impl Sandbox {
         h.update(parent.as_bytes());
         h.update([0]);
         h.update(self.base_stamp()?.as_bytes());
-        let tag = format!("{IMAGE_REPO}:{stem}-{}", &format!("{:x}", h.finalize())[..8]);
+        let tag = format!(
+            "{IMAGE_REPO}:{stem}-{}",
+            &format!("{:x}", h.finalize())[..8]
+        );
         if self.have_image(&tag)? {
             return Ok(tag);
         }
@@ -1322,16 +1559,24 @@ impl Sandbox {
         copy_context(context, &build)?;
         // Overwrites the copy of the authored Dockerfile: the build reads the
         // generated one, and the original stays where it was written.
-        fs::write(build.join("Dockerfile"), self.generated_dockerfile(&body, source, parent))?;
+        fs::write(
+            build.join("Dockerfile"),
+            self.generated_dockerfile(&body, source, parent),
+        )?;
 
         println!("building {tag} from {} ...", source.display());
-        passthrough(
-            "container",
-            &["build", "-t", &tag,
-              "--build-arg", &format!("USERNAME={}", self.user),
-              &build.to_string_lossy()],
-        )
-        .with_context(|| format!("building the image layer from {}", source.display()))?;
+        // Overlays go stale exactly the way the base does — an `apt-get
+        // install` in one is served from the builder's cache forever — so a
+        // no-cache rebuild has to reach them too, not just the layer beneath.
+        let user_arg = format!("USERNAME={}", self.user);
+        let ctx_arg = build.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec!["build", "-t", tag.as_str(), "--build-arg", &user_arg];
+        if self.no_cache {
+            args.push("--no-cache");
+        }
+        args.push(&ctx_arg);
+        self.cache_context(passthrough("container", &args))
+            .with_context(|| format!("building the image layer from {}", source.display()))?;
         self.prune_layer_images(record, &tag);
         Ok(tag)
     }
@@ -1366,8 +1611,12 @@ impl Sandbox {
     /// content-addressed, so an old one is never reused and they would
     /// otherwise accumulate one per edit; only the layers unique to them are
     /// freed, since everything underneath is shared.
+    ///
+    /// Noted per variant: the two bases produce different tags for the same
+    /// overlay, so a single marker would have each `--sudo` build delete the
+    /// image the ordinary one had just built, and back again.
     fn prune_layer_images(&self, record: &Path, keep: &str) {
-        let marker = record.join("built.tag");
+        let marker = record.join(format!("built{}.tag", variant(self.sudo)));
         if let Ok(prev) = fs::read_to_string(&marker) {
             let prev = prev.trim();
             // Two spellings because the runtime's is the one that matters and
@@ -1398,7 +1647,10 @@ impl Sandbox {
             }
             OverlayAction::Accept => {
                 if !self.overlay_src.is_dir() {
-                    bail!("nothing to accept: {} does not exist", self.overlay_src.display());
+                    bail!(
+                        "nothing to accept: {} does not exist",
+                        self.overlay_src.display()
+                    );
                 }
                 self.accept_overlay(&scan_context(&self.overlay_src)?)?;
                 Ok(())
@@ -1427,7 +1679,11 @@ impl Sandbox {
         }
         let current = scan_context(&self.overlay_src)?;
         let snap = self.overlay_snapshot();
-        let accepted = if snap.is_dir() { Some(scan_context(&snap)?) } else { None };
+        let accepted = if snap.is_dir() {
+            Some(scan_context(&snap)?)
+        } else {
+            None
+        };
         match accepted {
             Some(ref a) if a == &current => {
                 println!("status:   accepted ({}…)", &fingerprint(&current)[..12]);
@@ -1445,7 +1701,10 @@ impl Sandbox {
             None => {
                 println!("status:   NEW — never accepted\n");
                 show_context(&current);
-                println!("\naccept with:  claude-sandbox overlay --accept {}", self.abs.display());
+                println!(
+                    "\naccept with:  claude-sandbox overlay --accept {}",
+                    self.abs.display()
+                );
             }
         }
         if !current.iter().any(|e| e.path == "Dockerfile") {
@@ -1507,7 +1766,9 @@ impl Sandbox {
     /// Where the tag a container was created from is noted, for the staleness
     /// check in `ensure_container`.
     fn image_record(&self) -> PathBuf {
-        self.state_dir.join("containers").join(format!("{}.image", self.name))
+        self.state_dir
+            .join("containers")
+            .join(format!("{}.image", self.name))
     }
 
     /// The image a running container was created from, or None if it cannot be
@@ -1548,7 +1809,10 @@ impl Sandbox {
         if state.as_deref() == Some("running") {
             if let Some(prev) = self.container_image() {
                 if prev != image {
-                    println!("image changed ({prev} -> {image}) — recreating {}", self.name);
+                    println!(
+                        "image changed ({prev} -> {image}) — recreating {}",
+                        self.name
+                    );
                     self.destroy();
                     state = None;
                 }
@@ -1563,7 +1827,9 @@ impl Sandbox {
                 let idle = match env::var("CLAUDE_SANDBOX_IDLE") {
                     Ok(v) => {
                         v.parse::<u64>().map_err(|_| {
-                            anyhow!("CLAUDE_SANDBOX_IDLE must be a whole number of seconds, got: {v}")
+                            anyhow!(
+                                "CLAUDE_SANDBOX_IDLE must be a whole number of seconds, got: {v}"
+                            )
                         })?;
                         Some(format!("IDLE_TIMEOUT={v}"))
                     }
@@ -1574,7 +1840,7 @@ impl Sandbox {
                 let mount_claude =
                     format!("{}:/home/{}/.claude", self.claude_dir.display(), self.user);
                 // Read-only in the guest whenever the directory exists, which
-                // is independent of whether this run builds from it: --rebuild
+                // is independent of whether this run builds from it: `rebuild`
                 // and --no-overlay change what runs, not what is protected.
                 let overlay_env = format!("OVERLAY_DIR={}/{OVERLAY_DIR}", self.target);
 
@@ -1721,9 +1987,15 @@ impl Sandbox {
                 }
             }
             if i > 0 && i % 5 == 0 {
-                let where_ = if last.is_empty() { self.name.clone() } else { format!("{last}:22") };
+                let where_ = if last.is_empty() {
+                    self.name.clone()
+                } else {
+                    format!("{last}:22")
+                };
                 match &last_err {
-                    Some(e) => println!("waiting for sshd on {where_} ({i} attempts; last error: {e}) ..."),
+                    Some(e) => {
+                        println!("waiting for sshd on {where_} ({i} attempts; last error: {e}) ...")
+                    }
                     None => println!("waiting for sshd on {where_} ({i} attempts) ..."),
                 }
             }
@@ -1734,8 +2006,14 @@ impl Sandbox {
         // per-app local-network grant.
         bail!(
             "timed out waiting for sshd on {}{}{}",
-            if last.is_empty() { self.name.clone() } else { format!("{last}:22") },
-            last_err.map(|e| format!(" (last error: {e})")).unwrap_or_default(),
+            if last.is_empty() {
+                self.name.clone()
+            } else {
+                format!("{last}:22")
+            },
+            last_err
+                .map(|e| format!(" (last error: {e})"))
+                .unwrap_or_default(),
             local_network_hint()
         )
     }
@@ -1853,14 +2131,23 @@ fn guest_user() -> Result<String> {
         .trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     name.truncate(32); // useradd's limit
     let name = name.trim_end_matches('-').to_string();
     // useradd rejects a leading digit or '-', and root already exists (with a
     // uid the image does not use), so those cases need an explicit override
     // rather than a name invented here.
-    if name.is_empty() || name == "root" || !name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
+    if name.is_empty()
+        || name == "root"
+        || !name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+    {
         bail!(
             "cannot use {source} (\"{}\") as the account name inside the VM: it must \
              start with a letter or underscore, and cannot be root.\n  \

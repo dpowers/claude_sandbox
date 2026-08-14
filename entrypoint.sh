@@ -20,6 +20,13 @@
 # means pointing the guest at a public resolver instead (`container run
 # --dns 1.1.1.1 ...`), after which the exemption below can go.
 #
+# What the whole table is worth depends on the guest staying unprivileged:
+# these rules live in this VM's own kernel, so anything in here that can
+# become root can also run `nft delete table inet egress`. The image withholds
+# sudo by default for exactly that reason; `claude-sandbox --sudo` hands it
+# back, and with it the ability to undo everything below. The host-side
+# controls — the VM boundary and the two mounts — hold either way.
+#
 # Requires NET_ADMIN. Apple's `container` runs each container in its own VM
 # where root keeps that capability; with Docker, run with --cap-add=NET_ADMIN.
 # Fails closed: if the rules can't be applied the container exits instead of
@@ -86,11 +93,13 @@ EOF
 # host's builder next time. A read-only bind makes ordinary writes from in here
 # fail with EROFS.
 #
-# This is not a wall: the sandbox account has passwordless sudo and can remount
-# it rw. What it buys is that reaching the file at all takes a deliberate,
-# conspicuous act rather than an ordinary write. The control that actually
-# holds is host-side — the launcher will not build contents the host has not
-# seen and accepted.
+# This is a wall only as far as the guest stays unprivileged. By default the
+# sandbox account cannot become root, so `mount -o remount,rw` is simply
+# unavailable to it; under `claude-sandbox --sudo` it is one command away, and
+# what the bind buys there is only that reaching the file takes a deliberate,
+# conspicuous act rather than an ordinary write. Either way the control that
+# actually holds is host-side — the launcher will not build contents the host
+# has not seen and accepted.
 #
 # No directory means nothing to protect (including the race where it is deleted
 # on the host just after launch). A directory that exists but cannot be made

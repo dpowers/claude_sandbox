@@ -30,11 +30,31 @@ RUN npm install -g @anthropic-ai/claude-code && rm -rf /root/.npm
 RUN userdel -r ubuntu || true
 
 # User to ssh in as. No password is ever set: login is by public key only
-# (see SSH_PUBKEY below) and sudo is passwordless.
+# (see SSH_PUBKEY below), root login over ssh is off, and root's own password
+# is locked — so whether anything in this VM can become root is decided here.
+#
+# SUDO=0 (the default) leaves the account out of the sudo group and writes no
+# sudoers entry. That is what makes the in-guest controls real rather than
+# advisory: the egress firewall is enforced by this VM's own kernel and `nft`
+# needs root to change it, so an agent that decides to reach the LAN has
+# nowhere to go. Same for the read-only overlay mount the entrypoint sets up.
+# The `sudo` binary is deliberately left installed — attempting it then fails
+# with "is not in the sudoers file" rather than "command not found", which
+# says which of the two situations you are in.
+#
+# SUDO=1 (`claude-sandbox --sudo`) restores passwordless root. It buys
+# `apt-get install`, `npm install -g` and anything else that writes outside
+# $HOME from inside the VM, and it costs every in-guest control: root holds
+# CAP_NET_ADMIN here, so `nft delete table inet egress` drops the firewall in
+# one command. Only the host-side controls — the VM boundary, the two mounts,
+# and the overlay acceptance gate — still hold.
+ARG SUDO=0
 RUN useradd -m -u 1000 -s /bin/bash "$USERNAME" \
-    && usermod -aG sudo "$USERNAME" \
-    && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME" \
-    && chmod 440 "/etc/sudoers.d/$USERNAME"
+    && if [ "$SUDO" = 1 ]; then \
+         usermod -aG sudo "$USERNAME" \
+         && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME" \
+         && chmod 440 "/etc/sudoers.d/$USERNAME"; \
+       fi
 
 # Parent for the launcher's per-project bind mount, which lands at
 # /home/$USERNAME/Projects/<project> at run time.
