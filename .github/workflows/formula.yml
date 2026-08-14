@@ -18,8 +18,12 @@ jobs:
   style:
     name: brew style
     # Linting parses the formula rather than installing it, so it does not need
-    # the macOS/arm64 host the formula itself insists on.
+    # the macOS/arm64 host the formula itself insists on. The GitHub-hosted
+    # Ubuntu image has no `brew` on PATH, though, so unlike the macOS ones it
+    # has to be installed first — without the step below this job fails with
+    # "brew: command not found" before it ever reads the formula.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: Homebrew/actions/setup-homebrew@master
       - run: brew style Formula/claude-sandbox.rb
