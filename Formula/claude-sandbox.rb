@@ -23,12 +23,19 @@ class ClaudeSandbox < Formula
   # No livecheck block: it exists to spot new stable releases, and a head-only
   # formula has no stable version to compare against.
 
-  # Where rustup puts its shims, honouring CARGO_HOME the way rustup itself
-  # does. Resolved at load time, while the real HOME is still in scope: the
-  # build runs with HOME pointed at a sandbox temp dir, so `~` cannot be
-  # expanded from inside `install`.
+  # Where rustup puts its shims and its settings, honouring CARGO_HOME and
+  # RUSTUP_HOME the way rustup itself does. Resolved at load time, while the
+  # real HOME is still in scope: the build runs with HOME pointed at a sandbox
+  # temp dir, so `~` cannot be expanded from inside `install`.
+  #
+  # The ENV.fetches are dead code in practice: bin/brew re-execs under
+  # `env -i`, and a user's CARGO_HOME or RUSTUP_HOME survives only as a
+  # renamed HOMEBREW_* copy that nothing on the formula path reads. A machine
+  # with a non-default CARGO_HOME therefore misses this fast path and gets the
+  # brewed Rust instead — harmless, just not the honouring the fetch suggests.
   CARGO_BIN = File.expand_path("#{ENV.fetch("CARGO_HOME", "~/.cargo")}/bin").freeze
   RUSTUP_CARGO = "#{CARGO_BIN}/cargo".freeze
+  RUSTUP_ROOT = File.expand_path(ENV.fetch("RUSTUP_HOME", "~/.rustup")).freeze
 
   # Homebrew resolves `depends_on` against its own prefix and ignores rustup on
   # purpose — a formula's build is meant to be reproducible from Homebrew-managed
@@ -51,7 +58,21 @@ class ClaudeSandbox < Formula
     # superenv strips PATH back to Homebrew's own bin dirs, so rustup's shims
     # are invisible during the build unless they are put back. Harmless when the
     # brewed Rust is in play: that one is earlier in PATH regardless.
-    ENV.prepend_path "PATH", CARGO_BIN if File.executable?(RUSTUP_CARGO)
+    #
+    # RUSTUP_HOME rides along because PATH alone is not enough: the shim picks
+    # its toolchain from $RUSTUP_TOOLCHAIN, a rust-toolchain file, or
+    # $RUSTUP_HOME/settings.toml (defaulting to $HOME/.rustup), and the
+    # build's HOME is a sandbox temp dir — without this the build dies with
+    # "rustup could not choose a version of cargo to run". The real ~/.rustup
+    # stays readable inside the build sandbox, which denies only credential
+    # paths under the real home. Do NOT give CARGO_HOME the same treatment:
+    # cargo *writes* the registry cache there during the build, writes to the
+    # real home are denied, and the fake-HOME default is exactly where those
+    # writes belong.
+    if File.executable?(RUSTUP_CARGO)
+      ENV.prepend_path "PATH", CARGO_BIN
+      ENV["RUSTUP_HOME"] = RUSTUP_ROOT
+    end
     system "cargo", "install", *std_cargo_args
   end
 
