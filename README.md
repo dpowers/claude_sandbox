@@ -694,7 +694,10 @@ learning its MAC — connections fail with `EHOSTUNREACH`, the same error macOS
 returns when Local Network permission is denied. The launcher tells the two
 apart by duration: only a sustained run of failures (~15s) means the route is
 barred rather than still settling, and even then it confirms `sshd` over vsock
-before giving up.
+before giving up. Connects that *time out* count toward the same bar: silent
+SYN drops (a VPN's local-network filter, some modes of the permission gate)
+never answer at all, where a booting VM answers fast with unreachable or
+refused.
 
 ### The egress firewall
 

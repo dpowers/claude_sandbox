@@ -2213,6 +2213,9 @@ impl Sandbox {
     /// both sides — misdirects nobody. Warning-only: a VM without DNS is
     /// still a VM worth a shell.
     fn check_guest_dns(&self) {
+        // api.anthropic.com rather than a neutral name: it is the one host
+        // every sandbox needs reachable anyway (Claude Code is why the VM
+        // exists), so probing it can never flag a name the guest didn't need.
         if capture(
             "container",
             &["exec", &self.name, "timeout", "3", "getent", "hosts", "api.anthropic.com"],
@@ -2321,9 +2324,19 @@ impl Sandbox {
                             // way too (the host has not learned its MAC yet),
                             // so only a sustained run of these means the route
                             // is barred rather than still settling.
+                            //
+                            // A connect that *times out* counts too: on a local
+                            // bridge that means the SYNs are being dropped
+                            // silently — a VPN's local-network filter, and some
+                            // modes of the same per-app gate — where a VM still
+                            // booting answers fast with unreachable or refused.
+                            // Weighted at three so the ~15s bar means wall-clock
+                            // time either way: each timed-out attempt has
+                            // already spent the full 2s connect timeout.
                             blocked = match e.kind() {
                                 io::ErrorKind::HostUnreachable
                                 | io::ErrorKind::NetworkUnreachable => blocked + 1,
+                                io::ErrorKind::TimedOut => blocked + 3,
                                 _ => 0,
                             };
                             if blocked >= 15 || e.kind() == io::ErrorKind::PermissionDenied {
