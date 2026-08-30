@@ -17,8 +17,9 @@
 #
 # Known trade-off: port 53 to the host resolver is the one deliberate hole in
 # "no local network", and it doubles as a DNS-tunnelling channel. Closing it
-# means pointing the guest at a public resolver instead (`container run
-# --dns 1.1.1.1 ...`), after which the exemption below can go.
+# means pointing the guest at a public resolver instead (`claude-sandbox
+# --dns 1.1.1.1 <dir>`), after which the exemption below still fires but
+# covers an address the rejects never matched anyway.
 #
 # What the whole table is worth depends on the guest staying unprivileged:
 # these rules live in this VM's own kernel, so anything in here that can

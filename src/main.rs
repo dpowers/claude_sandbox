@@ -17,7 +17,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::io::{IsTerminal, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -141,6 +141,9 @@ struct VmArgs {
     #[arg(short, long, value_name = "N", default_value = DEFAULT_CPUS,
           value_parser = parse_cpus)]
     cpus: String,
+    /// Guest DNS resolver, replacing the runtime's own; repeatable
+    #[arg(long, value_name = "IP", value_parser = parse_dns)]
+    dns: Vec<String>,
 }
 
 #[derive(Args)]
@@ -264,6 +267,7 @@ enum OverlayAction {
 struct Opts {
     memory: String,
     cpus: String,
+    dns: Vec<String>,
     no_overlay: bool,
     accept_overlay: bool,
     sudo: bool,
@@ -275,6 +279,7 @@ impl Default for Opts {
         Opts {
             memory: DEFAULT_MEMORY.to_string(),
             cpus: DEFAULT_CPUS.to_string(),
+            dns: Vec::new(),
             no_overlay: false,
             accept_overlay: false,
             sudo: false,
@@ -321,6 +326,41 @@ fn parse_cpus(v: &str) -> Result<String> {
         bail!("must be at least 1");
     }
     Ok(n.to_string())
+}
+
+/// Validate a guest resolver for `container run --dns`. Round-tripped through
+/// IpAddr so what reaches the runtime is a plain, normalised address — which
+/// is also all the entrypoint's exemption sanitizer will accept.
+fn parse_dns(v: &str) -> Result<String> {
+    v.trim()
+        .parse::<IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|_| anyhow!("expected an IP address like 1.1.1.1 or 2606:4700:4700::1111"))
+}
+
+/// Resolvers from CLAUDE_SANDBOX_DNS — the set-and-forget form of `--dns`,
+/// for the machine where a VPN always needs it. Comma- or space-separated,
+/// validated like the flag so a typo fails the launch loudly rather than
+/// being handed to the runtime.
+fn env_dns() -> Result<Vec<String>> {
+    let Ok(v) = env::var("CLAUDE_SANDBOX_DNS") else {
+        return Ok(Vec::new());
+    };
+    v.split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| parse_dns(s).with_context(|| format!("CLAUDE_SANDBOX_DNS: {s:?}")))
+        .collect()
+}
+
+/// How a resolver list reads in a message: empty means nothing overrode the
+/// runtime's own service on the VM bridge.
+fn fmt_dns(list: &[String]) -> String {
+    if list.is_empty() {
+        "the runtime's own dns".to_string()
+    } else {
+        format!("dns {}", list.join(" "))
+    }
 }
 
 /// Byte count for a string `parse_memory` accepted, for comparing a request
@@ -446,6 +486,10 @@ struct Sandbox {
     overlay_state: PathBuf,
     memory: String,
     cpus: String,
+    /// Resolvers for the guest, passed to `container run --dns`; empty means
+    /// the runtime's own DNS service on the VM bridge. Fixed at creation,
+    /// like the resource limits.
+    dns: Vec<String>,
     /// Whether the guest account can become root. Baked into the image, so it
     /// is part of the base image's identity rather than a runtime switch.
     sudo: bool,
@@ -489,15 +533,15 @@ fn run() -> Result<()> {
                     )
                     .exit()
             };
-            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, ..a.image.into() };
+            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, dns: a.vm.dns, ..a.image.into() };
             (Cmd::Up, dir, opts, Vec::new(), OverlayAction::Status)
         }
         Some(Mode::Zed(a)) => {
-            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, ..a.image.into() };
+            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, dns: a.vm.dns, ..a.image.into() };
             (Cmd::Zed, a.dir, opts, Vec::new(), OverlayAction::Status)
         }
         Some(Mode::Shell(a)) => {
-            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, ..a.image.into() };
+            let opts = Opts { memory: a.vm.memory, cpus: a.vm.cpus, dns: a.vm.dns, ..a.image.into() };
             (Cmd::Shell, a.dir, opts, a.argv, OverlayAction::Status)
         }
         Some(Mode::Stop(a)) => (Cmd::Stop, a.dir, Opts::default(), Vec::new(), OverlayAction::Status),
@@ -866,6 +910,20 @@ impl Sandbox {
         // asks for the privileged image.
         let sudo = opts.sudo || env_enabled("CLAUDE_SANDBOX_SUDO");
 
+        // The flag names this run's resolvers; with it absent,
+        // CLAUDE_SANDBOX_DNS supplies the same list. Only the modes that can
+        // start a VM read either — a malformed address should fail a launch,
+        // not a `stop`.
+        let dns = if matches!(cmd, Cmd::Up | Cmd::Zed | Cmd::Shell) {
+            if opts.dns.is_empty() {
+                env_dns()?
+            } else {
+                opts.dns.clone()
+            }
+        } else {
+            Vec::new()
+        };
+
         Ok(Sandbox {
             key: state_dir.join("id_ed25519"),
             ssh_conf: state_dir.join("ssh_config"),
@@ -882,6 +940,7 @@ impl Sandbox {
             base_image: format!("{IMAGE_REPO}:{user}{}", variant(sudo)),
             memory: opts.memory.clone(),
             cpus: opts.cpus.clone(),
+            dns,
             proj_id,
             overlay_src,
             overlay_state,
@@ -917,9 +976,10 @@ impl Sandbox {
         self.destroy();
         self.strip_ssh_block();
         // The acceptance record survives (it is authored config, not derived
-        // state — `overlay --forget` drops it); only the note of which image
-        // the now-deleted container was created from goes.
+        // state — `overlay --forget` drops it); only the notes of which image
+        // and resolvers the now-deleted container was created from go.
         let _ = fs::remove_file(self.image_record());
+        let _ = fs::remove_file(self.dns_record());
         if existed {
             println!("deleted {}", self.name);
         } else {
@@ -1084,6 +1144,11 @@ impl Sandbox {
         // as a stable alias.
         let host = format!("{}.{domain}", self.name);
         let ip = self.wait_for_sshd(&host)?;
+        // sshd answering says nothing about DNS: the guest's default resolver
+        // is a host-local service that a VPN's leak protection can break while
+        // every other path works, and left unsaid that surfaces as npm and git
+        // failing in there with no hint out here.
+        self.check_guest_dns();
         self.ensure_ssh_config(&domain, &ip)?;
 
         if cmd == Cmd::Shell {
@@ -1933,26 +1998,40 @@ impl Sandbox {
     }
 
     /// Limits are fixed when the VM is created, and a running one is reused as
-    /// is, so `-m`/`-c` on an already-open project would otherwise do nothing
-    /// at all — quietly, which reads as though the resize took.
+    /// is, so `-m`/`-c`/`--dns` on an already-open project would otherwise do
+    /// nothing at all — quietly, which reads as though the change took.
     fn warn_if_limits_differ(&self) {
-        let Some((cpus, mem)) = self.resources() else {
-            return;
-        };
-        let want_cpus: u64 = self.cpus.parse().unwrap_or(cpus);
-        let want_mem = memory_bytes(&self.memory).unwrap_or(mem);
-        if (cpus, mem) == (want_cpus, want_mem) {
-            return;
+        if let Some((cpus, mem)) = self.resources() {
+            let want_cpus: u64 = self.cpus.parse().unwrap_or(cpus);
+            let want_mem = memory_bytes(&self.memory).unwrap_or(mem);
+            if (cpus, mem) != (want_cpus, want_mem) {
+                println!(
+                    "note: {} is already running with {cpus} cpus / {} — limits are set at \
+                     creation.\n  to run it with {} cpus / {}:  claude-sandbox rm {}",
+                    self.name,
+                    human_bytes(mem),
+                    self.cpus,
+                    self.memory,
+                    self.abs.display()
+                );
+            }
         }
-        println!(
-            "note: {} is already running with {cpus} cpus / {} — limits are set at \
-             creation.\n  to run it with {} cpus / {}:  claude-sandbox rm {}",
-            self.name,
-            human_bytes(mem),
-            self.cpus,
-            self.memory,
-            self.abs.display()
-        );
+        // No note means the VM predates the launcher recording resolvers;
+        // left alone rather than guessed at, and it resolves itself once the
+        // VM is recreated — same contract as the image record.
+        if let Ok(prev) = fs::read_to_string(self.dns_record()) {
+            let prev: Vec<String> = prev.split_whitespace().map(String::from).collect();
+            if prev != self.dns {
+                println!(
+                    "note: {} is already running with {} — dns is set at creation.\n  \
+                     to run it with {}:  claude-sandbox rm {}",
+                    self.name,
+                    fmt_dns(&prev),
+                    fmt_dns(&self.dns),
+                    self.abs.display()
+                );
+            }
+        }
     }
 
     /// Where the tag a container was created from is noted, for the staleness
@@ -1961,6 +2040,16 @@ impl Sandbox {
         self.state_dir
             .join("containers")
             .join(format!("{}.image", self.name))
+    }
+
+    /// Where the resolvers a container was created with are noted. Like the
+    /// limits, dns is fixed at creation — but unlike them `inspect` is not
+    /// guaranteed to report it, so the launcher keeps its own note for
+    /// `warn_if_limits_differ` and `check_guest_dns`.
+    fn dns_record(&self) -> PathBuf {
+        self.state_dir
+            .join("containers")
+            .join(format!("{}.dns", self.name))
     }
 
     /// The image a running container was created from, or None if it cannot be
@@ -2067,6 +2156,12 @@ impl Sandbox {
                 if let Some(e) = idle.as_deref() {
                     args.extend(["-e", e]);
                 }
+                // The runtime writes these into the guest's resolv.conf in
+                // place of its own bridge address; the entrypoint's firewall
+                // exemptions follow resolv.conf, so nothing else has to know.
+                for ns in &self.dns {
+                    args.extend(["--dns", ns.as_str()]);
+                }
                 if self.overlay_src.is_dir() {
                     args.extend(["-e", &overlay_env]);
                 }
@@ -2084,8 +2179,14 @@ impl Sandbox {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&record, format!("{image}\n"))?;
+                fs::write(self.dns_record(), format!("{}\n", self.dns.join(" ")))?;
+                let dns_note = if self.dns.is_empty() {
+                    String::new()
+                } else {
+                    format!(", dns {}", self.dns.join(" "))
+                };
                 println!(
-                    "created {} ({} cpus, {} memory) ({} -> {})",
+                    "created {} ({} cpus, {} memory{dns_note}) ({} -> {})",
                     self.name,
                     self.cpus,
                     self.memory,
@@ -2095,6 +2196,67 @@ impl Sandbox {
                 Ok(())
             }
             Some(other) => bail!("container {} is in unexpected state: {other}", self.name),
+        }
+    }
+
+    /// Probe name resolution inside the guest, and say why when it is broken.
+    ///
+    /// The guest's resolver is normally the runtime's own DNS service on the
+    /// VM bridge — a host-local path that a VPN's DNS leak protection
+    /// (Mullvad's, notably) blocks while leaving every other kind of traffic
+    /// working. Readiness is a TCP probe by pinned IP, so such a launch still
+    /// looks green, and the first sign of trouble is npm or git dying inside
+    /// the VM with nothing out here to say why. Asked over vsock via
+    /// `container exec`, so the answer does not depend on this process
+    /// reaching the VM's subnet; and only a guest failure paired with a host
+    /// that can resolve earns the hint, so being plain offline — which fails
+    /// both sides — misdirects nobody. Warning-only: a VM without DNS is
+    /// still a VM worth a shell.
+    fn check_guest_dns(&self) {
+        if capture(
+            "container",
+            &["exec", &self.name, "timeout", "3", "getent", "hosts", "api.anthropic.com"],
+        )
+        .is_ok()
+        {
+            return;
+        }
+        if ("api.anthropic.com", 443).to_socket_addrs().is_err() {
+            return;
+        }
+        // What the VM was actually created with — this launch's flags may
+        // differ, and warn_if_limits_differ has already said so if they do.
+        let effective: Vec<String> = fs::read_to_string(self.dns_record())
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_else(|_| self.dns.clone());
+        if effective.is_empty() {
+            eprintln!(
+                "claude-sandbox: warning: DNS inside the VM is not answering, though the \
+                 host resolves fine.\n  \
+                 The guest uses the runtime's own resolver on the VM bridge, and VPNs \
+                 with DNS\n  \
+                 leak protection — Mullvad among them — block that path while leaving \
+                 everything\n  \
+                 else working. Point the guest at a public resolver instead:\n    \
+                 claude-sandbox rm {dir}\n    \
+                 claude-sandbox --dns 1.1.1.1 {dir}\n  \
+                 or set CLAUDE_SANDBOX_DNS=1.1.1.1 to make that every VM's default. \
+                 This also\n  \
+                 closes the guest firewall's port-53 opening onto the local network.",
+                dir = self.abs.display()
+            );
+        } else {
+            eprintln!(
+                "claude-sandbox: warning: DNS inside the VM is not answering, though the \
+                 host resolves fine.\n  \
+                 This VM was created with dns {} — is that resolver reachable from \
+                 inside\n  \
+                 the VM? A VPN on the host may be blocking it; try another \
+                 (claude-sandbox rm {},\n  \
+                 then --dns with a different address).",
+                effective.join(" "),
+                self.abs.display()
+            );
         }
     }
 
@@ -2403,7 +2565,9 @@ fn local_network_hint() -> String {
          everything it launches:\n    \
          System Settings -> Privacy & Security -> Local Network -> enable {app}\n  \
          A prompt that was dismissed or denied makes these connections fail \
-         silently, exactly like this.\n  \
+         silently, exactly like this — and so does a VPN that blocks \
+         local-network traffic\n  \
+         (in Mullvad, enable \"Local network sharing\").\n  \
          Quick check from the same terminal:  nc -vz <vm-ip> 22"
     )
 }

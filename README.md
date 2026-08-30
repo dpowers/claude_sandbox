@@ -220,14 +220,15 @@ reject them) after it as well. Both `-m 12g` and `--memory=12g` forms work.
 | `--use-cache` | Only in the `rebuild` mode: let the builder answer from cache, so the rebuild picks up Dockerfile edits and nothing else. Seconds instead of minutes |
 | `--no-overlay` | Ignore both [image overlays](#image-overlays) for this run and boot the plain base image |
 | `--accept-overlay` | Accept the project overlay's current contents without prompting — for scripts, where there is no one to ask |
+| `--dns <ip>` | Resolver(s) for the guest, replacing the runtime's own DNS service; repeat for more than one. The way out when a VPN on the host breaks the default path — see [Troubleshooting](#troubleshooting) |
 | `-h`, `--help` | Usage for the launcher, or for one mode with `claude-sandbox <mode> --help` |
 | `-V`, `--version` | Print the launcher's version |
 
-`-m`/`-c` are read **when the VM is created**. A running VM keeps the limits it
-was created with, so passing different ones prints a note telling you to
-`claude-sandbox rm <dir>` first rather than silently doing nothing. The modes
-that never create a VM — `stop`, `rm`, `overlay`, `rebuild` — reject them
-outright instead of accepting them and doing nothing.
+`-m`/`-c`/`--dns` are read **when the VM is created**. A running VM keeps the
+limits and resolvers it was created with, so passing different ones prints a
+note telling you to `claude-sandbox rm <dir>` first rather than silently doing
+nothing. The modes that never create a VM — `stop`, `rm`, `overlay`,
+`rebuild` — reject them outright instead of accepting them and doing nothing.
 
 The defaults are deliberately not the host's full core count and RAM. There is
 one VM per project, so the ceilings multiply across everything you have open;
@@ -242,6 +243,7 @@ step can outgrow the rest of that gigabyte.
 | Variable | Effect |
 | --- | --- |
 | `CLAUDE_SANDBOX_IDLE` | Idle timeout in seconds, applied when the VM is created (`0` = never reap) |
+| `CLAUDE_SANDBOX_DNS` | Resolver(s) for every VM, same as `--dns`; comma- or space-separated. For the machine where a VPN always needs it |
 | `CLAUDE_SANDBOX_DEBUG` | Keep failed VMs around (skips `--rm`) so `container logs <name>` works |
 | `CLAUDE_SANDBOX_USER` | Account name inside the VM (default: your host username) |
 | `CLAUDE_SANDBOX_STATE` | Override the state directory (default `~/.config/claude-sandbox`) |
@@ -709,6 +711,13 @@ The DNS exemption matters because the resolver is itself on the local network
 rejected. There is no DHCP exemption: the runtime configures the VM's address
 directly, so no DHCP client runs.
 
+`--dns` replaces those resolvers, and with a public one the port-53 opening
+into the local network — the one deliberate exception here, and a
+DNS-tunnelling channel — closes: the exemption still fires, but for an address
+the reject rules never matched anyway. It is also the way out when a VPN on
+the host breaks the bridge resolver (see
+[Troubleshooting](#troubleshooting)).
+
 Resolver addresses are sanitized before they reach `nft`, so a malformed
 `/etc/resolv.conf` can neither inject syntax nor abort the fail-closed boot.
 
@@ -736,7 +745,7 @@ grace period down to the short idle timeout.
 | `~/.config/claude-sandbox/global/` | Your global overlay: a `Dockerfile` and anything it `COPY`s, layered onto every project |
 | `~/.config/claude-sandbox/overlays/<project>/` | Accepted overlay: `accepted.json` (fingerprint), `accepted/` (snapshot), `build/` (generated context), `built.tag` (and `built-sudo.tag`, one per base variant) |
 | `~/.config/claude-sandbox/overlays/_global/` | The same launcher-owned bits for the global overlay (`build/`, `built*.tag`) — no snapshot, since it is not gated |
-| `~/.config/claude-sandbox/containers/<name>.image` | Which image a running VM was created from, for the staleness check |
+| `~/.config/claude-sandbox/containers/<name>.image` | Which image a running VM was created from, for the staleness check. `<name>.dns` sits beside it: the resolvers it was created with, for the mismatch note and the DNS probe |
 | `~/.config/claude-sandbox/base-<user>.stamp` | Bumped on every base-image rebuild, so overlays rebuild on top of it. `base-<user>-sudo.stamp` is the same for the `--sudo` variant |
 | `~/.claude-sandbox/` | Mounted as `~/.claude` in every VM — the persistent Claude Code login and settings |
 
@@ -764,11 +773,22 @@ and nobody has to tag for installs to work — the version in `Cargo.toml` is wh
 ## Troubleshooting
 
 - **"timed out waiting for sshd" / "cannot reach …:22"** — almost always the
-  macOS Local Network grant for your terminal app. Check with
-  `nc -vz <vm-ip> 22` from the same terminal.
+  macOS Local Network grant for your terminal app; a VPN that blocks
+  local-network traffic does it too (in Mullvad, enable "Local network
+  sharing"). Check with `nc -vz <vm-ip> 22` from the same terminal.
 - **"stopped before sshd came up"** — the firewall failed to apply and the
   entrypoint bailed. Re-run with `CLAUDE_SANDBOX_DEBUG=1` to keep the container
   around, then `container logs <name>`.
+- **Lookups fail inside the VM (`npm install`, `git fetch`, `claude` cannot
+  resolve anything) while the host is fine — typically with a VPN up** — the
+  guest's default resolver is the runtime's own DNS service on the VM bridge,
+  and a VPN's DNS leak protection (Mullvad's, notably) blocks that path while
+  leaving ordinary traffic alone. The launcher probes DNS after every launch
+  and says so when it sees this. Recreate the VM with a public resolver —
+  `claude-sandbox rm <dir>`, then `claude-sandbox --dns 1.1.1.1 <dir>` — or
+  set `CLAUDE_SANDBOX_DNS=1.1.1.1` to make that every VM's default. A side
+  benefit: the guest firewall's port-53 opening onto the local network closes
+  (see [The egress firewall](#the-egress-firewall)).
 - **`container` subcommands failing with "Operation not permitted"** — the
   `container` CLI does not work under a restrictive command sandbox; run it
   from a normal shell.
